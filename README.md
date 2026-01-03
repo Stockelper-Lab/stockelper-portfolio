@@ -1,57 +1,190 @@
-# stockelper-portfolio
+# Stockelper Portfolio Service
 
-`stockelper-llm`(LangGraph/LangChain 기반)에서 **포트폴리오 도메인**을 분리한 로컬 실행 서비스입니다.
+LangGraph 기반 포트폴리오 추천 및 자동 매매 서비스입니다.
 
-## 실행
+## 🚀 주요 기능
 
-- **Python**: 3.12+
-- **uv** 사용
+- 투자 성향 기반 포트폴리오 추천
+- LangGraph 다중 에이전트 매수/매도 워크플로우
+- Black-Litterman 모델 기반 포트폴리오 최적화
+- 한국투자증권 (KIS) API 연동 실제 거래
+- 다중 지표 종목 랭킹 시스템
 
-```bash
-cd /Users/oldman/Library/CloudStorage/OneDrive-개인/001_Documents/001_TelePIX/000_workspace/03_PseudoLab/Stockelper-Lab/stockelper-portfolio
-uv sync --dev
-uv run python src/main.py
+## 📋 기술 스택
+
+- Python 3.12+
+- FastAPI 0.111
+- LangGraph (상태 그래프 기반 워크플로우)
+- LangChain 1.0+
+- PostgreSQL (asyncpg, psycopg)
+- OpenRouter API (Perplexity, GPT-4.5.1)
+- Korea Investment & Securities (KIS) API
+- OpenDartReader (한국 금융감독원 DART)
+
+## 🔌 API 엔드포인트
+
+### 기본
+- `GET /` - 루트 엔드포인트
+- `GET /health` - 헬스 체크
+
+### 포트폴리오
+- `POST /portfolio/recommendations` - 투자 성향 기반 추천
+- `POST /portfolio/buy` - 매수 워크플로우 (LangGraph)
+- `POST /portfolio/sell` - 매도 워크플로우 (LangGraph)
+
+## 🤖 LangGraph 워크플로우
+
+### 매수 워크플로우
+
+```
+Ranking (11개 지표 기반)
+  ↓
+Analysis (병렬 3개)
+  ├─ WebSearch (Perplexity)
+  ├─ FinancialStatement (재무제표)
+  └─ TechnicalIndicator (기술적 지표)
+  ↓
+ViewGenerator (Black-Litterman 뷰 생성)
+  ↓
+PortfolioBuilder (포트폴리오 최적화)
+  ↓
+PortfolioTrader (매수 주문 실행)
 ```
 
-- 기본 포트: **21010**
-- 포트 변경: `PORT=21010` 환경변수로 제어 (예: `PORT=21020 uv run python src/main.py`)
+### 매도 워크플로우
 
-## 주요 엔드포인트
+```
+GetPortfolioHoldings (보유 종목 조회)
+  ↓
+Analysis (병렬 3개)
+  ├─ WebSearch
+  ├─ FinancialStatement
+  └─ TechnicalIndicator
+  ↓
+SellDecisionMaker (매도 결정)
+  ↓
+PortfolioSeller (매도 주문 실행)
+```
 
-- **Health**
-  - `GET /health`
-- **투자 성향 기반 추천(기존 LLM 구현 이관)**
-  - `POST /portfolio/recommendations`
-- **포트폴리오 매수/매도 워크플로우(LangGraph)**
-  - `POST /portfolio/buy`
-  - `POST /portfolio/sell`
+## 📊 종목 랭킹 시스템
 
-## 환경변수(요약)
+11개 랭킹 함수:
+- 거래 활동성
+- 영업 이익률
+- 성장률
+- 부채 수준
+- 상승률
+- 안정성
+- 순이익
+- 하락률
+- 시가총액
 
-### `/portfolio/recommendations` (DB 기반 사용자/KIS 정보 조회)
+## ⚙️ 환경 변수
 
-- **필수**
-  - `ASYNC_DATABASE_URL`: 사용자 테이블(`users`) 접근용 async DB URL
-- **선택**
-  - `ASYNC_DATABASE_URL_KSIC`: 산업분류(KSIC) DB(없으면 업종명 조회 비활성)
-  - `OPEN_DART_API_KEY`: DART 기업정보 조회(OpenDartReader)
+```bash
+# 서버 설정
+HOST=0.0.0.0
+PORT=21010
+DEBUG=false
 
-> 주의: `multi_agent/portfolio_analysis_agent/tools/portfolio.py`는 호출 시점에 `ASYNC_DATABASE_URL`을 확인합니다. 서버 기동은 되지만, 값이 없으면 해당 API 호출 시 에러가 납니다.
+# 데이터베이스 (필수)
+ASYNC_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db
+ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택
 
-### `/portfolio/buy`, `/portfolio/sell` (portfolio_multi_agent)
+# KIS API (매수/매도 필수)
+APP_KEY=
+APP_SECRET=
+ACCESS_TOKEN=
+ACCOUNT_NO=12345678-01
+KIS_MAX_REQUESTS_PER_SECOND=20
 
-- **LLM(OpenRouter)**
-  - `OPENROUTER_API_KEY` (기본 base_url: `https://openrouter.ai/api/v1`)
-- **DART**
-  - `OPEN_DART_API_KEY`
-- **KIS(모의투자/조회/주문)**
-  - `APP_KEY`
-  - `APP_SECRET`
-  - `ACCESS_TOKEN` (보유종목 조회/주문 노드에서 사용)
-  - `ACCOUNT_NO` (예: `12345678-01`)
-  - `KIS_MAX_REQUESTS_PER_SECOND` (선택, 기본 20)
+# 외부 API
+OPEN_DART_API_KEY=
+OPENROUTER_API_KEY=
+```
 
-## 비고
+## 🚀 빠른 시작
 
-- 이 레포는 **서비스 분리**(Repo split)를 위한 1차 이관 상태입니다.
-- 프론트엔드/LLM 서버와의 연결(프록시/호출부)은 별도 레포(`stockelper-fe`, `stockelper-llm`)에서 환경변수 기반으로 맞추는 것을 전제로 합니다.
+### 로컬 실행
+
+```bash
+# 의존성 설치
+uv sync --dev
+
+# 서버 실행
+PORT=21010 uv run python src/main.py
+```
+
+### Docker 실행
+
+```bash
+# 빌드 및 실행
+docker-compose up -d
+
+# 로그 확인
+docker-compose logs -f stockelper-portfolio-server
+```
+
+## 📝 API 사용 예시
+
+### 포트폴리오 추천
+
+```bash
+curl -X POST http://localhost:21010/portfolio/recommendations   -H "Content-Type: application/json"   -d '{
+    "user_id": 1,
+    "investor_type": "안정형"
+  }'
+```
+
+### 매수 워크플로우
+
+```bash
+curl -X POST http://localhost:21010/portfolio/buy   -H "Content-Type: application/json"   -d '{
+    "max_portfolio_size": 10,
+    "rank_weight": {...},
+    "portfolio_list": [...],
+    "risk_free_rate": 0.03
+  }'
+```
+
+### 매도 워크플로우
+
+```bash
+curl -X POST http://localhost:21010/portfolio/sell   -H "Content-Type: application/json"   -d '{
+    "loss_threshold": -0.05,
+    "profit_threshold": 0.15
+  }'
+```
+
+## 🗄️ 데이터베이스
+
+### users 테이블
+- id, kis_app_key, kis_app_secret
+- kis_access_token, account_no
+- investor_type
+- created_at, updated_at
+
+### industy 테이블 (KSIC DB)
+- industy_code (5자리 코드)
+- industy_name (산업 분류명)
+
+## 🔒 보안
+
+- 모든 API 키 환경 변수 관리
+- KIS 토큰 자동 갱신 (DB 저장)
+- Rate limiting (초당 20 요청)
+- `.env` 파일 커밋 금지
+
+## 🐳 Docker 구성
+
+### 서비스
+- **stockelper-portfolio-server** (포트: 21010)
+  - FastAPI 애플리케이션
+  - 헬스체크: `/health`
+
+### 네트워크
+- `stockelper` 브리지 네트워크
+
+## 📄 라이선스
+
+MIT License
