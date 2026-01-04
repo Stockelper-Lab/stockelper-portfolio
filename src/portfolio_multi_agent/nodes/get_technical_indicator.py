@@ -9,6 +9,13 @@ import mojito
 
 
 class InputState(BaseModel):
+    # user context (LoadUserContext에서 채워짐)
+    user_id: int | None = Field(default=None, description="사용자 ID")
+    kis_app_key: str | None = Field(default=None, description="KIS App Key")
+    kis_app_secret: str | None = Field(default=None, description="KIS App Secret")
+    kis_access_token: str | None = Field(default=None, description="KIS Access Token")
+    account_no: str | None = Field(default=None, description="계좌번호")
+
     portfolio_list: list[Stock] = Field(default_factory=list)
 
 
@@ -40,6 +47,23 @@ class TechnicalIndicator:
         if not state.portfolio_list:
             return {"analysis_results": [], "market_data_list": []}
 
+        app_key = getattr(state, "kis_app_key", None)
+        app_secret = getattr(state, "kis_app_secret", None)
+        acc_no = getattr(state, "account_no", None)
+
+        if not all([app_key, app_secret, acc_no]):
+            # 자격증명이 없으면 종목별 오류만 반환
+            analysis_results = [
+                AnalysisResult(
+                    code=s.code,
+                    name=s.name,
+                    type="technical_indicator",
+                    result="오류: 사용자 KIS 자격증명/계좌(account_no)가 없어 기술적 지표를 조회할 수 없습니다.",
+                )
+                for s in state.portfolio_list
+            ]
+            return {"analysis_results": analysis_results, "market_data_list": []}
+
         batch_size = self._get_batch_size()
         all_results = []
 
@@ -47,7 +71,7 @@ class TechnicalIndicator:
         for i in range(0, len(state.portfolio_list), batch_size):
             batch = state.portfolio_list[i : i + batch_size]
 
-            batch_results = await self._execute_batch(batch)
+            batch_results = await self._execute_batch(batch, app_key, app_secret, acc_no)
             all_results.extend(batch_results)
 
             # 마지막 배치가 아니면 대기 (Rate Limit 준수)
@@ -69,10 +93,13 @@ class TechnicalIndicator:
         return int(os.getenv("KIS_MAX_REQUESTS_PER_SECOND", "20"))
 
     async def _execute_batch(
-        self, batch: List[Stock]
+        self, batch: List[Stock], app_key: str, app_secret: str, acc_no: str
     ) -> List[Tuple[AnalysisResult, MarketData | None]]:
         """배치 단위로 기술적 지표 분석 실행 (병렬 처리)"""
-        tasks = [asyncio.to_thread(self.analyze_single_stock, stock) for stock in batch]
+        tasks = [
+            asyncio.to_thread(self.analyze_single_stock, stock, app_key, app_secret, acc_no)
+            for stock in batch
+        ]
         return await asyncio.gather(*tasks, return_exceptions=True)
 
     def _filter_and_split_results(
@@ -96,15 +123,13 @@ class TechnicalIndicator:
 
         return analysis_results, market_data_list
 
-    def get_stock_data(self, stock_code: str) -> pd.DataFrame | None:
+    def get_stock_data(
+        self, stock_code: str, app_key: str, app_secret: str, acc_no: str
+    ) -> pd.DataFrame | None:
         """
         한국투자증권 API를 사용하여 주식 일별 데이터 조회 (mojito 라이브러리 사용, 최근 30일 고정)
         """
-        app_key = os.getenv("APP_KEY")
-        app_secret = os.getenv("APP_SECRET")
-        acc_no = os.getenv("ACCOUNT_NO", "01234567-01")  # 기본값 제공
-
-        if not all([app_key, app_secret]):
+        if not all([app_key, app_secret, acc_no]):
             return None
 
         # mojito 브로커 객체 생성
@@ -240,7 +265,7 @@ class TechnicalIndicator:
         return indicators
 
     def analyze_single_stock(
-        self, stock: Stock
+        self, stock: Stock, app_key: str, app_secret: str, acc_no: str
     ) -> Tuple[AnalysisResult, MarketData | None]:
         """
         단일 종목에 대한 기술적 지표 분석 및 시장 데이터 생성
@@ -252,7 +277,7 @@ class TechnicalIndicator:
             (AnalysisResult, MarketData) 튜플
         """
         # 주식 데이터 조회
-        df = self.get_stock_data(stock.code)
+        df = self.get_stock_data(stock.code, app_key, app_secret, acc_no)
 
         if df is None or df.empty:
             error_result = AnalysisResult(

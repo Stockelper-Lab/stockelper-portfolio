@@ -1,16 +1,15 @@
-version: "3.8"
-
 services:
   portfolio-server:
     container_name: stockelper-portfolio-server
+    image: stockelper-portfolio-server:latest
     build:
       context: .
     ports:
-      - "21010:21010"
+      - "21008:21008"
     environment:
       # Server
       HOST: ${HOST:-0.0.0.0}
-      PORT: ${PORT:-21010}
+      PORT: ${PORT:-21008}
       DEBUG: ${DEBUG:-false}
 
       # DB (stockelper-fe Prisma의 DATABASE_URL과 호환되도록 둘 다 지원)
@@ -24,15 +23,13 @@ services:
       OPEN_DART_API_KEY: ${OPEN_DART_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
 
-      # KIS (portfolio_multi_agent buy/sell에서 사용)
-      APP_KEY: ${APP_KEY:-}
-      APP_SECRET: ${APP_SECRET:-}
-      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
-      ACCOUNT_NO: ${ACCOUNT_NO:-}
+      # (선택) schema 명이 stockelper_web가 아니라면 지정
+      STOCKELPER_WEB_SCHEMA: ${STOCKELPER_WEB_SCHEMA:-public}
+
       KIS_MAX_REQUESTS_PER_SECOND: ${KIS_MAX_REQUESTS_PER_SECOND:-20}
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:21010/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:21008/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -45,5 +42,3 @@ networks:
   stockelper:
     # 여러 레포(LLM/FE/Portfolio/Backtesting)를 같은 네트워크에 붙이기 위한 고정 이름
     name: stockelper
-
-

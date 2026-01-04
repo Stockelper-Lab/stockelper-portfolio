@@ -19,7 +19,14 @@ def map_buy_analysis(state: BuyOverallState):
         send_list.append(
             Send(
                 node=node,
-                arg=AnalysisInputState(portfolio_list=state.portfolio_list),
+                arg=AnalysisInputState(
+                    user_id=state.user_id,
+                    kis_app_key=state.kis_app_key,
+                    kis_app_secret=state.kis_app_secret,
+                    kis_access_token=state.kis_access_token,
+                    account_no=state.account_no,
+                    portfolio_list=state.portfolio_list,
+                ),
             ),
         )
     return send_list
@@ -33,6 +40,7 @@ def build_buy_workflow():
         output_schema=BuyOutputState,
     )
 
+    workflow.add_node(LoadUserContext.name, LoadUserContext())
     workflow.add_node(Ranking.name, Ranking())
     workflow.add_node(WebSearch.name, WebSearch())
     workflow.add_node(FinancialStatement.name, FinancialStatement())
@@ -41,7 +49,8 @@ def build_buy_workflow():
     workflow.add_node(PortfolioBuilder.name, PortfolioBuilder())
     workflow.add_node(PortfolioTrader.name, PortfolioTrader())
 
-    workflow.add_edge("__start__", Ranking.name)
+    workflow.add_edge("__start__", LoadUserContext.name)
+    workflow.add_edge(LoadUserContext.name, Ranking.name)
     workflow.add_conditional_edges(Ranking.name, map_buy_analysis)
     workflow.add_edge(WebSearch.name, ViewGenerator.name)
     workflow.add_edge(FinancialStatement.name, ViewGenerator.name)
@@ -64,7 +73,14 @@ def map_sell_analysis(state: SellOverallState):
         send_list.append(
             Send(
                 node=node,
-                arg=AnalysisInputState(portfolio_list=portfolio_list),
+                arg=AnalysisInputState(
+                    user_id=state.user_id,
+                    kis_app_key=state.kis_app_key,
+                    kis_app_secret=state.kis_app_secret,
+                    kis_access_token=state.kis_access_token,
+                    account_no=state.account_no,
+                    portfolio_list=portfolio_list,
+                ),
             ),
         )
     return send_list
@@ -78,6 +94,7 @@ def build_sell_workflow():
         output_schema=SellOutputState,
     )
 
+    workflow.add_node(LoadUserContext.name, LoadUserContext())
     workflow.add_node(GetPortfolioHoldings.name, GetPortfolioHoldings())
     workflow.add_node(WebSearch.name, WebSearch())
     workflow.add_node(FinancialStatement.name, FinancialStatement())
@@ -85,7 +102,8 @@ def build_sell_workflow():
     workflow.add_node(SellDecisionMaker.name, SellDecisionMaker(model="gpt-5.1"))
     workflow.add_node(PortfolioSeller.name, PortfolioSeller())
 
-    workflow.add_edge("__start__", GetPortfolioHoldings.name)
+    workflow.add_edge("__start__", LoadUserContext.name)
+    workflow.add_edge(LoadUserContext.name, GetPortfolioHoldings.name)
     workflow.add_conditional_edges(GetPortfolioHoldings.name, map_sell_analysis)
     workflow.add_edge(WebSearch.name, SellDecisionMaker.name)
     workflow.add_edge(FinancialStatement.name, SellDecisionMaker.name)

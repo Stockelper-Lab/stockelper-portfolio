@@ -8,6 +8,13 @@ from .rank_func import *
 
 
 class InputState(BaseModel):
+    # user context (LoadUserContext에서 채워짐)
+    user_id: int | None = Field(default=None, description="사용자 ID")
+    kis_app_key: str | None = Field(default=None, description="KIS App Key")
+    kis_app_secret: str | None = Field(default=None, description="KIS App Secret")
+    kis_access_token: str | None = Field(default=None, description="KIS Access Token")
+    account_no: str | None = Field(default=None, description="계좌번호")
+
     max_portfolio_size: int = Field(
         default=10, description="Maximum number of stocks in the portfolio"
     )
@@ -28,8 +35,8 @@ class Ranking:
     name = "Ranking"
 
     async def __call__(self, state: InputState) -> OutputState:
-        # 1. API 인증 정보 로드
-        creds = self._get_api_credentials()
+        # 1. API 인증 정보 로드 (DB에서 로드된 값)
+        creds = self._get_api_credentials(state)
 
         # 2. 실행할 작업 목록 생성
         active_tasks = self._get_active_tasks(state)
@@ -50,13 +57,18 @@ class Ranking:
             "ranking_details": ranking_details,
         }
 
-    def _get_api_credentials(self) -> Dict[str, str]:
-        """API 인증 정보 로드"""
-        return {
-            "app_key": os.getenv("APP_KEY", ""),
-            "app_secret": os.getenv("APP_SECRET", ""),
-            "access_token": os.getenv("ACCESS_TOKEN", ""),
-        }
+    def _get_api_credentials(self, state: Any) -> Dict[str, str]:
+        """API 인증 정보 로드 (state에 주입된 사용자 KIS 자격증명 사용)"""
+        app_key = getattr(state, "kis_app_key", None) or ""
+        app_secret = getattr(state, "kis_app_secret", None) or ""
+        access_token = getattr(state, "kis_access_token", None) or ""
+
+        if not app_key or not app_secret or not access_token:
+            raise ValueError(
+                "KIS 자격증명이 없습니다. LoadUserContext 단계에서 user 정보를 로드하지 못했습니다."
+            )
+
+        return {"app_key": app_key, "app_secret": app_secret, "access_token": access_token}
 
     def _get_active_tasks(self, state: InputState) -> List[Tuple[str, Callable, float]]:
         """실행할 순위 함수 목록 생성 (가중치가 0이 아닌 것만)"""

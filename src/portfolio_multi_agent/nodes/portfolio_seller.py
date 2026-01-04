@@ -13,6 +13,13 @@ from portfolio_multi_agent.state import (
 
 
 class InputState(BaseModel):
+    # user context (LoadUserContext에서 채워짐)
+    user_id: int | None = Field(default=None, description="사용자 ID")
+    kis_app_key: str | None = Field(default=None, description="KIS App Key")
+    kis_app_secret: str | None = Field(default=None, description="KIS App Secret")
+    kis_access_token: str | None = Field(default=None, description="KIS Access Token")
+    account_no: str | None = Field(default=None, description="계좌번호")
+
     holding_stocks: list[HoldingStock] = Field(default_factory=list)
     sell_decisions: list[SellDecision] = Field(default_factory=list)
 
@@ -127,15 +134,15 @@ class PortfolioSeller:
             print("[PortfolioSeller] 매도할 종목이 없습니다.")
             return {"sell_result": None}
 
-        # 환경변수에서 API 인증 정보 읽기
-        app_key = os.getenv("APP_KEY")
-        app_secret = os.getenv("APP_SECRET")
-        access_token = os.getenv("ACCESS_TOKEN")
-        account_no = os.getenv("ACCOUNT_NO")
+        # 사용자별 KIS 자격증명/계좌 (LoadUserContext에서 세팅)
+        app_key = getattr(state, "kis_app_key", None)
+        app_secret = getattr(state, "kis_app_secret", None)
+        access_token = getattr(state, "kis_access_token", None)
+        account_no = getattr(state, "account_no", None)
 
         if not all([app_key, app_secret, access_token, account_no]):
             print(
-                "[PortfolioSeller] 환경변수 누락: APP_KEY, APP_SECRET, ACCESS_TOKEN, ACCOUNT_NO가 필요합니다."
+                "[PortfolioSeller] 사용자 KIS 자격증명/계좌가 없어 매도 주문을 실행할 수 없습니다."
             )
             return {"sell_result": None}
 

@@ -6,7 +6,12 @@ from portfolio_multi_agent.state import HoldingStock, Stock
 
 
 class InputState(BaseModel):
-    pass
+    # user context (LoadUserContext에서 채워짐)
+    user_id: int = Field(description="사용자 ID")
+    kis_app_key: str | None = Field(default=None)
+    kis_app_secret: str | None = Field(default=None)
+    kis_access_token: str | None = Field(default=None)
+    account_no: str | None = Field(default=None)
 
 
 class OutputState(BaseModel):
@@ -65,8 +70,17 @@ class GetPortfolioHoldings:
             response = await loop.run_in_executor(
                 None, lambda: requests.get(url, headers=headers, params=params)
             )
-            response.raise_for_status()
-            res_data = response.json()
+            # KIS는 토큰 만료 등에서 HTTP 500 + JSON(msg1) 형태로 내려오기도 하므로,
+            # raise_for_status() 이전에 본문(JSON)을 먼저 확인합니다.
+            try:
+                res_data = response.json()
+            except Exception:
+                response.raise_for_status()
+                raise
+
+            # NOTE:
+            # 본 프로젝트는 LoadUserContext에서 매 요청마다 access_token을 발급/DB에 저장한 뒤 사용합니다.
+            # 따라서 여기서는 token 자동 갱신을 별도로 수행하지 않습니다.
 
             # 응답 코드 확인
             if res_data.get("rt_cd") != "0":
@@ -120,15 +134,15 @@ class GetPortfolioHoldings:
         Returns:
             보유 종목 리스트
         """
-        # 환경변수에서 API 인증 정보 읽기
-        app_key = os.getenv("APP_KEY")
-        app_secret = os.getenv("APP_SECRET")
-        access_token = os.getenv("ACCESS_TOKEN")
-        account_no = os.getenv("ACCOUNT_NO")
+        # 사용자별 KIS 자격증명/계좌 (LoadUserContext에서 세팅)
+        app_key = getattr(state, "kis_app_key", None)
+        app_secret = getattr(state, "kis_app_secret", None)
+        access_token = getattr(state, "kis_access_token", None)
+        account_no = getattr(state, "account_no", None)
 
         if not all([app_key, app_secret, access_token, account_no]):
             print(
-                "[GetPortfolioHoldings] 환경변수 누락: APP_KEY, APP_SECRET, ACCESS_TOKEN, ACCOUNT_NO가 필요합니다."
+                "[GetPortfolioHoldings] 사용자 KIS 자격증명/계좌가 없습니다. user_id 기반 DB 로드가 필요합니다."
             )
             return {"holding_stocks": []}
 

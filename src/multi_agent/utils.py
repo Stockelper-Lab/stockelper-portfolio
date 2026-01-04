@@ -1,15 +1,19 @@
-import json
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-import os
-import requests
-import json
-from dotenv import load_dotenv
-import aiohttp
+from __future__ import annotations
+
 import asyncio
-from sqlalchemy import create_engine, Column, Integer, Text, TIMESTAMP, select
-from sqlalchemy.orm import declarative_base, Session
+import json
+import os
+from typing import Any, Optional
+
+import aiohttp
+import requests
+from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from sqlalchemy import Column, Integer, Text, TIMESTAMP, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 
 load_dotenv(override=True)
 
@@ -17,16 +21,26 @@ Base = declarative_base()
 
 # 사용자 테이블 모델 정의
 class User(Base):
+    # NOTE: stockelper_web DB 의 `users` 테이블을 참조
     __tablename__ = "users"
+    __table_args__ = {"schema": os.getenv("STOCKELPER_WEB_SCHEMA", "public")}
 
     id = Column(Integer, primary_key=True)
     kis_app_key = Column(Text, nullable=False)
     kis_app_secret = Column(Text, nullable=False)
     kis_access_token = Column(Text, nullable=True)
-    account_no = Column(Text, nullable=False) # ex) "50132452-01"
-    investor_type = Column(Text, nullable=True)
-    created_at = Column(TIMESTAMP, server_default=func.now())
-    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    account_no = Column(Text, nullable=True)  # ex) "50132452-01"
+
+
+# 설문 테이블 모델 정의 (stockelper_web schema)
+class Survey(Base):
+    __tablename__ = "survey"
+    __table_args__ = {"schema": os.getenv("STOCKELPER_WEB_SCHEMA", "public")}
+
+    # 컬럼 구조는 프로젝트 DB에 따라 달라질 수 있어, 여기서는 필요한 최소 컬럼만 매핑합니다.
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    answer = Column(JSONB, nullable=True)
 
 # 산업분류 테이블 모델 정의
 class Industy(Base):
@@ -49,13 +63,14 @@ async def get_user_kis_credentials(async_engine: object, user_id: int):
                 "kis_app_secret": user.kis_app_secret,
                 "kis_access_token": user.kis_access_token,
                 "account_no": user.account_no,
-                "investor_type": user.investor_type
             }
         else:
             return None
 
 
-async def update_user_kis_credentials(async_engine: object, user_id: int, access_token: str):
+async def update_user_kis_credentials(
+    async_engine: object, user_id: int, access_token: str
+):
     async with AsyncSession(async_engine) as session:
         stmt = select(User).where(User.id == user_id)
         result = await session.execute(stmt)
@@ -66,6 +81,181 @@ async def update_user_kis_credentials(async_engine: object, user_id: int, access
         user.kis_access_token = access_token
         await session.commit()
         return True
+
+
+async def get_user_survey_answer(async_engine: object, user_id: int) -> Optional[dict]:
+    """stockelper_web.survey.answer(JSON)에서 user_id의 설문 응답을 조회합니다."""
+    async with AsyncSession(async_engine) as session:
+        # 일반적으로 유저당 1건이라고 가정하고, 여러 건이면 최신(id desc)을 선택
+        stmt = select(Survey).where(Survey.user_id == user_id).order_by(Survey.id.desc())
+        result = await session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+
+        answer = row.answer
+        if answer is None:
+            return None
+        if isinstance(answer, dict):
+            return answer
+        # 안전하게 문자열 JSON도 지원
+        try:
+            return json.loads(str(answer))
+        except Exception:
+            return None
+
+
+# =====================
+# 투자 성향(설문) 매핑
+# =====================
+
+_Q1_MAP = {
+    1: "미성년자",
+    2: "20대",
+    3: "30대",
+    4: "40대",
+    5: "50대",
+    6: "60대 이상",
+}
+_Q2_MAP = {
+    1: "30백만원 이하",
+    2: "50백만원 이하",
+    3: "70백만원 이하",
+    4: "90백만원 이하",
+    5: "90백만원 초과",
+}
+_Q3_MAP = {
+    1: "5% 이하",
+    2: "10% 이하",
+    3: "15% 이하",
+    4: "20% 이하",
+    5: "20% 초과",
+}
+_Q4_MAP = {
+    1: "현재 일정한 수입이 있고, 앞으로 유지되거나 늘어날 것 같아요",
+    2: "현재 일정한 수입이 있지만, 앞으로 줄어들거나 불안정해질 것 같아요",
+    3: "일정한 수입이 없거나, 주로 연금으로 생활하고 있어요",
+}
+_Q5_MAP = {
+    1: "예금/적금/국채/MMF 등(안전)",
+    2: "금융채/우량회사채/채권형펀드/원금보장형 ELS(비교적 안전)",
+    3: "중간등급 회사채/부분 원금보장 ELS/혼합형펀드(중간 위험)",
+    4: "저신용 회사채/주식/원금 비보장 ELS/주식형펀드(위험)",
+    5: "ELW/선물옵션/고수익 주식형펀드/파생상품/신용거래(고위험)",
+}
+_Q6_MAP = {
+    1: "파생상품 포함 대부분 구조/위험을 잘 이해",
+    2: "주식/채권/펀드 구조/위험을 깊이 이해",
+    3: "주식/채권/펀드 기본 특징을 앎",
+    4: "투자 경험 없음",
+}
+_Q7_MAP = {
+    1: "높은 수익 위해 원금 손실 위험도 감수",
+    2: "원금 20% 미만 손실 감수 가능",
+    3: "원금 10% 미만 손실 감수 가능",
+    4: "원금 반드시 보전",
+}
+_Q8_MAP = {
+    1: "3년 이상",
+    2: "2~3년",
+    3: "1~2년",
+    4: "6개월~1년",
+    5: "6개월 미만",
+}
+
+
+def survey_answer_to_investor_type(answer: dict) -> str:
+    """survey.answer(JSON) 기반으로 투자 성향을 5단계로 산출합니다.
+
+    반환값: "안정형" | "안정추구형" | "위험중립형" | "적극투자형" | "공격투자형"
+    """
+    # 안전한 기본값
+    if not isinstance(answer, dict):
+        return "위험중립형"
+
+    q1 = int(answer.get("q1", 0) or 0)
+    q2 = int(answer.get("q2", 0) or 0)
+    q3 = int(answer.get("q3", 0) or 0)
+    q4 = int(answer.get("q4", 0) or 0)
+    q6 = int(answer.get("q6", 0) or 0)
+    q7 = int(answer.get("q7", 0) or 0)
+    q8 = int(answer.get("q8", 0) or 0)
+
+    q5_raw = answer.get("q5", [])
+    if isinstance(q5_raw, list) and q5_raw:
+        q5 = int(max(q5_raw))
+    elif isinstance(q5_raw, (int, float, str)) and str(q5_raw).isdigit():
+        q5 = int(q5_raw)
+    else:
+        q5 = 0
+
+    # 0~1로 정규화(1이 더 공격적)
+    # q1(연령): 20대가 가장 공격적, 60대 이상이 가장 보수적
+    age_score_map = {1: 0.7, 2: 1.0, 3: 0.85, 4: 0.7, 5: 0.5, 6: 0.3}
+    age_score = age_score_map.get(q1, 0.6)
+
+    income_score = (q2 - 1) / 4 if 1 <= q2 <= 5 else 0.5
+    asset_score = (q3 - 1) / 4 if 1 <= q3 <= 5 else 0.5
+
+    # q4(수입 전망): 1(안정/증가)이 공격적, 3(연금/무수입)이 보수적
+    income_outlook_map = {1: 1.0, 2: 0.5, 3: 0.0}
+    income_outlook_score = income_outlook_map.get(q4, 0.5)
+
+    exp_score = (q5 - 1) / 4 if 1 <= q5 <= 5 else 0.0
+
+    knowledge_map = {1: 1.0, 2: 0.7, 3: 0.4, 4: 0.0}
+    knowledge_score = knowledge_map.get(q6, 0.3)
+
+    loss_tol_map = {1: 1.0, 2: 0.7, 3: 0.4, 4: 0.0}
+    loss_tol_score = loss_tol_map.get(q7, 0.2)
+
+    horizon_map = {1: 1.0, 2: 0.8, 3: 0.6, 4: 0.3, 5: 0.0}
+    horizon_score = horizon_map.get(q8, 0.4)
+
+    # 가중합 (손실감수/경험/기간/이해도 중심)
+    risk_score = (
+        0.25 * loss_tol_score
+        + 0.15 * exp_score
+        + 0.15 * horizon_score
+        + 0.15 * knowledge_score
+        + 0.10 * income_outlook_score
+        + 0.10 * age_score
+        + 0.05 * income_score
+        + 0.05 * asset_score
+    )
+
+    if risk_score < 0.2:
+        return "안정형"
+    if risk_score < 0.4:
+        return "안정추구형"
+    if risk_score < 0.6:
+        return "위험중립형"
+    if risk_score < 0.8:
+        return "적극투자형"
+    return "공격투자형"
+
+
+def format_survey_answer_korean(answer: dict) -> str:
+    """디버깅/로그용: survey.answer를 사람이 읽을 수 있게 변환합니다."""
+    if not isinstance(answer, dict):
+        return ""
+    q5 = answer.get("q5", [])
+    if isinstance(q5, list):
+        q5_text = ", ".join(_Q5_MAP.get(int(x), str(x)) for x in q5)
+    else:
+        q5_text = _Q5_MAP.get(int(q5), str(q5))
+
+    parts = [
+        f"q1(연령대): {_Q1_MAP.get(int(answer.get('q1', 0)), 'N/A')}",
+        f"q2(연간소득): {_Q2_MAP.get(int(answer.get('q2', 0)), 'N/A')}",
+        f"q3(금융자산비중): {_Q3_MAP.get(int(answer.get('q3', 0)), 'N/A')}",
+        f"q4(수입전망): {_Q4_MAP.get(int(answer.get('q4', 0)), 'N/A')}",
+        f"q5(투자경험): {q5_text or 'N/A'}",
+        f"q6(이해도): {_Q6_MAP.get(int(answer.get('q6', 0)), 'N/A')}",
+        f"q7(손실감수): {_Q7_MAP.get(int(answer.get('q7', 0)), 'N/A')}",
+        f"q8(기간): {_Q8_MAP.get(int(answer.get('q8', 0)), 'N/A')}",
+    ]
+    return "\n".join(parts)
 
 
 async def get_access_token(app_key, app_secret):

@@ -1,9 +1,12 @@
 import os
 import asyncio
+import logging
 from pydantic import BaseModel, Field
 from portfolio_multi_agent.state import Stock, AnalysisResult
 import OpenDartReader
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class InputState(BaseModel):
@@ -18,12 +21,26 @@ class FinancialStatement:
     name = "FinancialStatement"
 
     def __init__(self):
-        api_key = os.getenv("OPEN_DART_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "오류: OPEN_DART_API_KEY 환경변수가 설정되어 있지 않습니다."
+        # 워크플로우 컴파일 단계에서 외부 API(네트워크) 호출로 서버가 죽지 않도록
+        # DART 클라이언트는 실제 분석 호출 시점에 지연 초기화합니다.
+        self.api_key = os.getenv("OPEN_DART_API_KEY")
+        self.dart = None
+        if not self.api_key:
+            logger.warning(
+                "OPEN_DART_API_KEY is not set; FinancialStatement analysis will be disabled."
             )
-        self.dart = OpenDartReader(api_key)
+
+    def _get_dart(self):
+        """DART 클라이언트를 지연 초기화하여 반환합니다."""
+        if self.dart is not None:
+            return self.dart
+        if not self.api_key:
+            raise ValueError("OPEN_DART_API_KEY 환경변수가 설정되어 있지 않습니다.")
+        try:
+            self.dart = OpenDartReader(self.api_key)
+        except Exception as e:
+            raise ValueError(f"OpenDartReader 초기화 실패: {e}") from e
+        return self.dart
 
     async def __call__(self, state: InputState) -> OutputState:
         """
@@ -199,6 +216,17 @@ class FinancialStatement:
         Returns:
             AnalysisResult 객체
         """
+        # DART 클라이언트 준비(키 누락/무효시 에러 메시지 반환)
+        try:
+            dart = self._get_dart()
+        except Exception as e:
+            return AnalysisResult(
+                code=stock.code,
+                name=stock.name,
+                type="financial_statement",
+                result=f"오류: DART API 초기화 실패 - {e}",
+            )
+
         # 최근 5년 내 재무제표 데이터 조회
         current_year = datetime.now().year
         financial_statement_all = None
@@ -206,7 +234,7 @@ class FinancialStatement:
         for offset in range(5):
             year = current_year - offset
             try:
-                df = self.dart.finstate_all(stock.code, year)
+                df = dart.finstate_all(stock.code, year)
 
                 if df is not None and not df.empty:
                     financial_statement_all = df

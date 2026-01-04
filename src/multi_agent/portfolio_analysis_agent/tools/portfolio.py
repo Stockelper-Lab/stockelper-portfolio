@@ -127,6 +127,45 @@ class PortfolioAnalysisTool(BaseTool):
         logger.debug("Headers created: %s", headers)
         return headers
 
+    def _ensure_dart_client(self):
+        """DART 클라이언트/락을 지연 초기화합니다.
+
+        OpenDartReader는 초기화 시 corp_codes를 조회하는데, 이를 종목마다 반복하면
+        DART API 한도 초과(status=020)로 이어질 수 있습니다. (요청당 1회만 초기화)
+        """
+        if not hasattr(self, "_dart_lock"):
+            self._dart_lock = asyncio.Lock()
+        if not hasattr(self, "_dart_client"):
+            self._dart_client = None
+        if not hasattr(self, "_dart_api_key"):
+            self._dart_api_key = None
+
+    async def _get_dart_client(self):
+        """가능하면 OpenDartReader 인스턴스를 재사용하여 반환합니다."""
+        api_key = os.getenv("OPEN_DART_API_KEY")
+        if not api_key:
+            return None
+
+        self._ensure_dart_client()
+
+        # 이미 같은 키로 초기화돼 있으면 그대로 사용
+        if getattr(self, "_dart_client", None) is not None and getattr(self, "_dart_api_key", None) == api_key:
+            return self._dart_client
+
+        async with self._dart_lock:
+            # double-check
+            if getattr(self, "_dart_client", None) is not None and getattr(self, "_dart_api_key", None) == api_key:
+                return self._dart_client
+            try:
+                self._dart_client = OpenDartReader(api_key)
+                self._dart_api_key = api_key
+            except Exception as e:
+                # 키 오류/한도 초과 등: 추천 전체가 죽지 않도록 None 처리
+                logger.warning("Failed to initialize OpenDartReader: %s", e)
+                self._dart_client = None
+                self._dart_api_key = api_key
+        return self._dart_client
+
 
     async def get_top_market_value(self, fid_rank_sort_cls_code, user_info):
         """시가총액 상위 종목을 조회합니다.
@@ -182,8 +221,30 @@ class PortfolioAnalysisTool(BaseTool):
 
     async def get_stock_basic_info(self, symbol):
         """OpenDART API를 사용하여 기업 정보를 조회하고, 산업분류명을 추가합니다."""
-        dart = OpenDartReader(os.getenv("OPEN_DART_API_KEY"))
-        result = dart.company(symbol)
+        dart = await self._get_dart_client()
+        if dart is None:
+            # DART 키가 없거나 초기화 실패 시 최소 정보만 반환(추천은 계속 진행)
+            return {
+                "corp_name": symbol,
+                "corp_cls": None,
+                "market": "N/A",
+                "induty_code": None,
+                "induty_name": "N/A",
+            }
+
+        # DART 사용량 초과/키 오류 등으로 실패할 수 있으므로, 추천이 전체적으로 죽지 않게 처리
+        try:
+            # OpenDartReader는 동기 호출이므로 thread로 실행
+            result = await asyncio.to_thread(dart.company, symbol)
+        except Exception as e:
+            logger.warning("DART company lookup failed for %s: %s", symbol, e)
+            return {
+                "corp_name": symbol,
+                "corp_cls": None,
+                "market": "N/A",
+                "induty_code": None,
+                "induty_name": "N/A",
+            }
 
         result["market"] = MARKET_MAP.get(result.get("corp_cls"), result.get("corp_cls"))
         
@@ -580,10 +641,18 @@ class PortfolioAnalysisTool(BaseTool):
         logger.info("Portfolio analysis completed. Total stocks analyzed: %d", len(portfolio_data))
         # 3. 투자 성향에 따른 포트폴리오 구성
         if should_update_access_token:
-            from multi_agent.utils import update_user_kis_credentials
-            await update_user_kis_credentials(
-                get_async_engine(), user_info["id"], user_info["kis_access_token"]
-            )
+            # 토큰이 갱신된 경우 DB(user.kis_access_token)에 저장
+            try:
+                from multi_agent.utils import update_user_kis_credentials
+
+                await update_user_kis_credentials(
+                    get_async_engine(), user_info["id"], user_info["kis_access_token"]
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to persist refreshed KIS access token to DB: %s",
+                    e,
+                )
         return self._build_portfolio_recommendation(portfolio_data, risk_level)
 
     def _calculate_total_score(self, stability: float, profit: float, 
@@ -721,17 +790,37 @@ class PortfolioAnalysisTool(BaseTool):
         risk_profile: 투자자의 위험 성향 (선택적)
         top_n: 분석할 종목 수
         """
-        # try:
-        # user_info를 가져오는 비동기 호출
-        user_info = await get_user_kis_credentials(
-            async_engine=get_async_engine(), user_id=config["configurable"]["user_id"]
-        )
-        update_access_token_flag = False
+        # user_id 기반으로 stockelper_web.user 테이블에서 KIS 자격증명/계좌를 조회합니다.
+        user_id = (config or {}).get("configurable", {}).get("user_id")
+        if user_id is None:
+            raise ValueError("user_id가 없습니다. 요청에 user_id를 포함해주세요.")
 
-        if not user_info['kis_access_token']:
-            access_token = await get_access_token(user_info['kis_app_key'], user_info['kis_app_secret'])
-            user_info['kis_access_token'] = access_token
-            update_access_token_flag = True
+        user_info = await get_user_kis_credentials(
+            async_engine=get_async_engine(), user_id=user_id
+        )
+        if not user_info:
+            raise ValueError(f"user_id={user_id} 사용자를 DB에서 찾지 못했습니다.")
+
+        # DB에 저장된 토큰이 있으면 재사용하고,
+        # 없으면 app_key/app_secret으로 발급받아 user.kis_access_token에 저장합니다.
+        access_token = user_info.get("kis_access_token")
+        if not access_token:
+            access_token = await get_access_token(
+                user_info["kis_app_key"], user_info["kis_app_secret"]
+            )
+            if not access_token:
+                raise ValueError(
+                    "KIS access token 발급에 실패했습니다. KIS 키를 확인해주세요."
+                )
+            user_info["kis_access_token"] = access_token
+            try:
+                from multi_agent.utils import update_user_kis_credentials
+
+                await update_user_kis_credentials(
+                    get_async_engine(), user_id, access_token
+                )
+            except Exception as e:
+                logger.warning("Failed to persist issued KIS access token to DB: %s", e)
         
         # 포트폴리오 분석 실행
         analysis_result = await self.analyze_portfolio(user_investor_type, user_info, top_n=20)

@@ -84,23 +84,26 @@ PortfolioSeller (매도 주문 실행)
 ```bash
 # 서버 설정
 HOST=0.0.0.0
-PORT=21010
+PORT=21008
 DEBUG=false
 
 # 데이터베이스 (필수)
-ASYNC_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db
-ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택
+# - stockelper_web DB를 가리켜야 합니다.
+# - /portfolio/* 에서 user_id 기반으로 public.users / public.survey 를 조회합니다.
+DATABASE_URL=postgresql://user:pass@host:5432/stockelper_web
+ASYNC_DATABASE_URL=
 
-# KIS API (매수/매도 필수)
-APP_KEY=
-APP_SECRET=
-ACCESS_TOKEN=
-ACCOUNT_NO=12345678-01
-KIS_MAX_REQUESTS_PER_SECOND=20
+# (선택) 기본 schema는 public 입니다. 다르면 지정
+STOCKELPER_WEB_SCHEMA=public
+
+ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택
 
 # 외부 API
 OPEN_DART_API_KEY=
 OPENROUTER_API_KEY=
+
+# (선택) KIS 호출 Rate Limit (초당 최대 요청 수)
+KIS_MAX_REQUESTS_PER_SECOND=20
 ```
 
 ## 🚀 빠른 시작
@@ -112,7 +115,7 @@ OPENROUTER_API_KEY=
 uv sync --dev
 
 # 서버 실행
-PORT=21010 uv run python src/main.py
+PORT=21008 uv run python src/main.py
 ```
 
 ### Docker 실행
@@ -130,19 +133,21 @@ docker-compose logs -f stockelper-portfolio-server
 ### 포트폴리오 추천
 
 ```bash
-curl -X POST http://localhost:21010/portfolio/recommendations   -H "Content-Type: application/json"   -d '{
-    "user_id": 1,
-    "investor_type": "안정형"
-  }'
+curl -X POST http://localhost:21008/portfolio/recommendations \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": 1}'
 ```
 
 ### 매수 워크플로우
 
 ```bash
-curl -X POST http://localhost:21010/portfolio/buy   -H "Content-Type: application/json"   -d '{
+curl -X POST http://localhost:21008/portfolio/buy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": 1,
     "max_portfolio_size": 10,
-    "rank_weight": {...},
-    "portfolio_list": [...],
+    "rank_weight": {"market_cap": 1.0},
+    "portfolio_list": [],
     "risk_free_rate": 0.03
   }'
 ```
@@ -150,7 +155,10 @@ curl -X POST http://localhost:21010/portfolio/buy   -H "Content-Type: applicatio
 ### 매도 워크플로우
 
 ```bash
-curl -X POST http://localhost:21010/portfolio/sell   -H "Content-Type: application/json"   -d '{
+curl -X POST http://localhost:21008/portfolio/sell \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": 1,
     "loss_threshold": -0.05,
     "profit_threshold": 0.15
   }'
@@ -158,11 +166,15 @@ curl -X POST http://localhost:21010/portfolio/sell   -H "Content-Type: applicati
 
 ## 🗄️ 데이터베이스
 
-### users 테이블
-- id, kis_app_key, kis_app_secret
-- kis_access_token, account_no
-- investor_type
-- created_at, updated_at
+### public.users 테이블
+- id
+- kis_app_key, kis_app_secret
+- kis_access_token (요청 시 발급 후 저장)
+- account_no
+
+### public.survey 테이블
+- user_id
+- answer (JSON) 예: {"q1": 3, "q2": 5, ...}
 
 ### industy 테이블 (KSIC DB)
 - industy_code (5자리 코드)
@@ -178,7 +190,7 @@ curl -X POST http://localhost:21010/portfolio/sell   -H "Content-Type: applicati
 ## 🐳 Docker 구성
 
 ### 서비스
-- **stockelper-portfolio-server** (포트: 21010)
+- **stockelper-portfolio-server** (포트: 21008)
   - FastAPI 애플리케이션
   - 헬스체크: `/health`
 

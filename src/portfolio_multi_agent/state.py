@@ -96,6 +96,7 @@ class TradingResult(BaseModel):
 
 
 class BuyInputState(BaseModel):
+    user_id: int = Field(description="사용자 ID (stockelper_web.user 참조)")
     max_portfolio_size: int = Field(
         default=10, description="Maximum number of stocks in the portfolio"
     )
@@ -107,6 +108,12 @@ class BuyInputState(BaseModel):
 
 
 class BuyPrivateState(BaseModel):
+    # KIS 자격증명/계좌 (DB에서 조회 후 세팅)
+    kis_app_key: Optional[str] = Field(default=None, description="KIS App Key")
+    kis_app_secret: Optional[str] = Field(default=None, description="KIS App Secret")
+    kis_access_token: Optional[str] = Field(default=None, description="KIS Access Token")
+    account_no: Optional[str] = Field(default=None, description="계좌번호 (ex: 50132452-01)")
+
     analysis_results: Annotated[list[AnalysisResult], add_value] = Field(
         default_factory=list
     )
@@ -168,6 +175,7 @@ class SellResult(BaseModel):
 
 class SellInputState(BaseModel):
     """매도 워크플로우 입력 상태"""
+    user_id: int = Field(description="사용자 ID (stockelper_web.user 참조)")
 
     loss_threshold: float = Field(
         default=-0.10, description="손실 매도 기준 (소수, 예: -0.10 = -10%)"
@@ -179,6 +187,12 @@ class SellInputState(BaseModel):
 
 class SellPrivateState(BaseModel):
     """매도 워크플로우 내부 상태"""
+
+    # KIS 자격증명/계좌 (DB에서 조회 후 세팅)
+    kis_app_key: Optional[str] = Field(default=None, description="KIS App Key")
+    kis_app_secret: Optional[str] = Field(default=None, description="KIS App Secret")
+    kis_access_token: Optional[str] = Field(default=None, description="KIS Access Token")
+    account_no: Optional[str] = Field(default=None, description="계좌번호 (ex: 50132452-01)")
 
     holding_stocks: list[HoldingStock] = Field(
         default_factory=list, description="보유 종목 리스트"
@@ -210,3 +224,14 @@ class SellOutputState(BaseModel):
 
 class SellOverallState(SellInputState, SellPrivateState, SellOutputState):
     pass
+
+
+class AnalysisInputState(BaseModel):
+    """분석 노드(웹검색/재무/기술)에 전달되는 입력 상태"""
+
+    user_id: int = Field(description="사용자 ID")
+    kis_app_key: Optional[str] = Field(default=None)
+    kis_app_secret: Optional[str] = Field(default=None)
+    kis_access_token: Optional[str] = Field(default=None)
+    account_no: Optional[str] = Field(default=None)
+    portfolio_list: list[Stock] = Field(default_factory=list)
