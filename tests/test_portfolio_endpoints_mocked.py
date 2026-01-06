@@ -39,6 +39,15 @@ def test_portfolio_recommendations_mocked(monkeypatch):
         lambda answer: "안정형",
         raising=True,
     )
+    async def fake_insert_portfolio_recommendation(*args, **kwargs):  # noqa: ANN001
+        return {"id": "test-id", "job_id": "test-job-id"}
+
+    monkeypatch.setattr(
+        portfolio_router,
+        "insert_portfolio_recommendation",
+        fake_insert_portfolio_recommendation,
+        raising=True,
+    )
 
     client = TestClient(app)
     res = client.post(
@@ -47,6 +56,8 @@ def test_portfolio_recommendations_mocked(monkeypatch):
     )
     assert res.status_code == 200
     payload = res.json()
+    assert payload["id"] == "test-id"
+    assert payload["job_id"] == "test-job-id"
     assert payload["investor_type"] == "안정형"
     assert payload["result"] == "MOCK_RECOMMENDATION_RESULT"
 

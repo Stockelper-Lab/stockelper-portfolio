@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
+from datetime import datetime
 from typing import Any, Optional
 
 import aiohttp
@@ -41,6 +43,29 @@ class Survey(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, nullable=False)
     answer = Column(JSONB, nullable=True)
+
+
+# 포트폴리오 추천 결과 적재 테이블
+class PortfolioRecommendation(Base):
+    __tablename__ = "portfolio_recommendations"
+    __table_args__ = {"schema": os.getenv("STOCKELPER_WEB_SCHEMA", "public")}
+
+    # DB 스키마: public.portfolio_recommendations
+    # - id (text, PK, NOT NULL)
+    # - job_id (text, nullable)
+    # - user_id (int, NOT NULL)
+    # - investor_type (text, NOT NULL)
+    # - result (text, NOT NULL)
+    # - created_at (timestamp, NOT NULL, default CURRENT_TIMESTAMP)
+    # - updated_at (timestamp, NOT NULL)
+    id = Column(Text, primary_key=True)
+    job_id = Column(Text, nullable=True)
+    user_id = Column(Integer, nullable=False)
+    investor_type = Column(Text, nullable=False)
+    result = Column(Text, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, nullable=False)
+
 
 # 산업분류 테이블 모델 정의
 class Industy(Base):
@@ -103,6 +128,38 @@ async def get_user_survey_answer(async_engine: object, user_id: int) -> Optional
             return json.loads(str(answer))
         except Exception:
             return None
+
+
+async def insert_portfolio_recommendation(
+    async_engine: object,
+    user_id: int,
+    investor_type: str,
+    result: str,
+) -> dict:
+    """public.portfolio_recommendations에 추천 결과를 적재합니다.
+
+    - job_id는 UUID4를 새로 생성해 부여합니다.
+    - id(PK)도 UUID4로 생성해 저장합니다.
+    """
+    rec_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow()  # DB 컬럼이 timestamp without time zone 이므로 naive UTC 사용
+
+    async with AsyncSession(async_engine) as session:
+        session.add(
+            PortfolioRecommendation(
+                id=rec_id,
+                job_id=job_id,
+                user_id=user_id,
+                investor_type=investor_type,
+                result=result,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+
+    return {"id": rec_id, "job_id": job_id}
 
 
 # =====================

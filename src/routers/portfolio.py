@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from multi_agent.portfolio_analysis_agent.tools.portfolio import PortfolioAnalysisTool
 from multi_agent.utils import (
     get_user_survey_answer,
+    insert_portfolio_recommendation,
     survey_answer_to_investor_type,
 )
 from portfolio_multi_agent.builder import build_buy_workflow, build_sell_workflow
@@ -85,7 +86,19 @@ async def recommend_portfolio(body: PortfolioRecommendationRequest):
         config={"configurable": {"user_id": body.user_id}},
     )
 
-    return {"investor_type": investor_type, "result": result}
+    saved = await insert_portfolio_recommendation(
+        engine,
+        user_id=body.user_id,
+        investor_type=investor_type,
+        result=result,
+    )
+
+    return {
+        "id": saved["id"],
+        "job_id": saved["job_id"],
+        "investor_type": investor_type,
+        "result": result,
+    }
 
 
 @router.post("/buy", status_code=status.HTTP_200_OK)

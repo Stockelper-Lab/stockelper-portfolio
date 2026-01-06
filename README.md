@@ -138,6 +138,9 @@ curl -X POST http://localhost:21008/portfolio/recommendations \
   -d '{"user_id": 1}'
 ```
 
+- 응답에는 `id`(PK)와 `job_id`(UUID)가 포함되며,
+  추천 결과는 DB의 `public.portfolio_recommendations` 테이블에 적재됩니다.
+
 ### 매수 워크플로우
 
 ```bash
@@ -175,6 +178,14 @@ curl -X POST http://localhost:21008/portfolio/sell \
 ### public.survey 테이블
 - user_id
 - answer (JSON) 예: {"q1": 3, "q2": 5, ...}
+
+### public.portfolio_recommendations 테이블
+- id (PK, text)
+- job_id (UUID string)
+- user_id (FK → public.users.id)
+- investor_type (text)
+- result (text)
+- created_at, updated_at
 
 ### industy 테이블 (KSIC DB)
 - industy_code (5자리 코드)
