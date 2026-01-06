@@ -113,14 +113,39 @@ class PortfolioAnalysisTool(BaseTool):
     return_direct: bool = True
 
     def _ensure_rate_limiter(self):
-        if not hasattr(self, "_rate_sem"):
-            self._rate_sem = asyncio.Semaphore(2)
+        # NOTE:
+        # KIS는 초당 거래건수(TPS) 제한이 있으며, 이를 초과하면
+        # rt_cd=1, msg1="초당 거래건수를 초과하였습니다." 형태로 응답이 내려옵니다.
+        # 특히 다수 종목을 병렬로 분석할 때 burst가 나기 쉬워, "균등 간격" 제한을 둡니다.
+        if not hasattr(self, "_kis_rate_lock"):
+            self._kis_rate_lock = asyncio.Lock()
+        if not hasattr(self, "_kis_next_allowed_at"):
+            self._kis_next_allowed_at = 0.0
+        if not hasattr(self, "_kis_min_interval"):
+            # 전용 환경변수로 조절 (기본 1 rps)
+            raw = (os.getenv("KIS_ANALYSIS_MAX_REQUESTS_PER_SECOND") or "").strip()
+            try:
+                max_rps = float(raw) if raw else 1.0
+            except Exception:
+                max_rps = 1.0
+            max_rps = max(0.1, max_rps)
+            self._kis_min_interval = 1.0 / max_rps
 
     async def _throttle(self):
         self._ensure_rate_limiter()
-        await self._rate_sem.acquire()
-        asyncio.get_running_loop().call_later(1.0, self._rate_sem.release)
-        # pass
+        async with self._kis_rate_lock:
+            now = time.monotonic()
+            wait_s = float(self._kis_next_allowed_at) - now
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            # 다음 요청 가능 시각을 갱신(균등 간격)
+            self._kis_next_allowed_at = time.monotonic() + float(self._kis_min_interval)
+            return
+
+    @staticmethod
+    def _is_kis_rate_limit_message(msg: str) -> bool:
+        m = (msg or "").strip()
+        return "초당 거래건수를 초과" in m or "초당거래건수를 초과" in m
 
     def _make_headers(self, tr_id: str, user_info: dict) -> dict:
         """공통 헤더 생성 함수"""
@@ -136,6 +161,75 @@ class PortfolioAnalysisTool(BaseTool):
         }
         logger.debug("Headers created: %s", headers)
         return headers
+
+    async def _kis_get_json(
+        self,
+        url: str,
+        headers: dict,
+        params: dict,
+        user_info: dict,
+        *,
+        endpoint: str,
+        symbol: str | None = None,
+        max_retries: int = 3,
+    ) -> tuple[dict | None, bool, dict]:
+        """KIS GET 호출 공통 처리(토큰 만료/레이트리밋/JSON 파싱).
+
+        Returns:
+            (data|None, update_access_token_flag, user_info)
+        """
+        update_access_token_flag = False
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attempt in range(max(1, int(max_retries))):
+                await self._throttle()
+                async with session.get(url, headers=headers, params=params) as response:
+                    status_code = response.status
+                    text = await response.text()
+
+                # 토큰 만료/무효: 1회 재발급 후 재시도
+                if status_code in (401, 403, 500) and (
+                    "기간이 만료된 token" in text or "유효하지 않은 token" in text
+                ):
+                    user_info["kis_access_token"] = await get_access_token(
+                        user_info["kis_app_key"], user_info["kis_app_secret"]
+                    )
+                    update_access_token_flag = True
+                    headers["authorization"] = f"Bearer {user_info['kis_access_token']}"
+                    continue
+
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning(
+                        "KIS %s JSON parse failed: symbol=%s status=%s text=%s",
+                        endpoint,
+                        symbol,
+                        status_code,
+                        text[:200],
+                    )
+                    return None, update_access_token_flag, user_info
+
+                if data.get("rt_cd") != "0":
+                    msg1 = str(data.get("msg1", ""))
+                    # 레이트리밋: 잠시 대기 후 재시도
+                    if self._is_kis_rate_limit_message(msg1) and attempt < max_retries - 1:
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+
+                    logger.warning(
+                        "KIS %s API error: symbol=%s rt_cd=%s msg1=%s",
+                        endpoint,
+                        symbol,
+                        data.get("rt_cd"),
+                        msg1,
+                    )
+                    return None, update_access_token_flag, user_info
+
+                return data, update_access_token_flag, user_info
+
+        return None, update_access_token_flag, user_info
 
     def _get_kis_trading_id(self) -> str:
         """KIS 계좌 조회/주문 등 trading API용 tr_id를 반환합니다.
@@ -444,72 +538,38 @@ class PortfolioAnalysisTool(BaseTool):
             "fid_cond_mrkt_div_code": 'J'
         }
 
-        async with aiohttp.ClientSession() as session:
-            await self._throttle()
-            async with session.get(url, headers=headers, params=params) as response:
-                status_code = response.status
-                text = await response.text()
+        data, update_access_token_flag, user_info = await self._kis_get_json(
+            url,
+            headers,
+            params,
+            user_info,
+            endpoint="stability-ratio",
+            symbol=symbol,
+        )
+        api_output = ((data or {}).get("output") or [])[:4]
+        n = len(api_output)
 
-                update_access_token_flag = False
-                if status_code in (401, 403, 500) and ("기간이 만료된 token" in text or "유효하지 않은 token" in text):
-                    user_info['kis_access_token'] = await get_access_token(user_info['kis_app_key'], user_info['kis_app_secret'])
-                    update_access_token_flag = True
+        if n == 0:
+            return 0.0, [], update_access_token_flag, user_info
 
-                    headers["authorization"] = (
-                        f"Bearer {user_info['kis_access_token']}"
-                    )
-                    await self._throttle()
-                    async with session.get(
-                        url, headers=headers, params=params
-                    ) as res_refresh:
-                        status_code = res_refresh.status
-                        text = await res_refresh.text()
+        df = pd.DataFrame(api_output)
+        cols = ["lblt_rate", "bram_depn", "crnt_rate", "quck_rate"]
+        
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            min_value = df[c].min()
+            max_value = df[c].max() if df[c].max() > min_value else min_value + 1
+            df[c] = (df[c] - min_value) / (max_value - min_value)
 
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    logger.warning(
-                        "KIS stability-ratio JSON parse failed: symbol=%s status=%s text=%s",
-                        symbol,
-                        status_code,
-                        text[:200],
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        weights = [0.5, 0.3, 0.15, 0.05]
+        if n < 4:
+            weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
+        df["StabilityScore"] = df[cols].mean(axis=1)
+        df["weight"] = weights
+        df["weighted_score"] = df["StabilityScore"] * df["weight"]
+        final_score = df["weighted_score"].sum()
 
-                if data.get("rt_cd") != "0":
-                    logger.warning(
-                        "KIS stability-ratio API error: symbol=%s rt_cd=%s msg1=%s",
-                        symbol,
-                        data.get("rt_cd"),
-                        data.get("msg1"),
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
-
-                api_output = (data.get("output") or [])[:4]
-                n = len(api_output)
-    
-                if n == 0:
-                    logger.warning("KIS stability-ratio empty output: symbol=%s", symbol)
-                    return 0.0, [], update_access_token_flag, user_info
-
-                df = pd.DataFrame(api_output)
-                cols = ["lblt_rate", "bram_depn", "crnt_rate", "quck_rate"]
-                
-                for c in cols:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                    min_value = df[c].min()
-                    max_value = df[c].max() if df[c].max() > min_value else min_value + 1
-                    df[c] = (df[c] - min_value) / (max_value - min_value)
-
-                weights = [0.5, 0.3, 0.15, 0.05]
-                if n < 4:
-                    weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
-                df["StabilityScore"] = df[cols].mean(axis=1)
-                df["weight"] = weights
-                df["weighted_score"] = df["StabilityScore"] * df["weight"]
-                final_score = df["weighted_score"].sum()
-
-                return final_score, api_output, update_access_token_flag, user_info
+        return final_score, api_output, update_access_token_flag, user_info
 
 
     async def get_profit_ratio(self, symbol: str, div_cd: str = "1", user_info=None):
@@ -522,72 +582,38 @@ class PortfolioAnalysisTool(BaseTool):
             "fid_cond_mrkt_div_code": 'J'
         }
 
-        async with aiohttp.ClientSession() as session:
-            await self._throttle()
-            async with session.get(url, headers=headers, params=params) as response:
-                status_code = response.status
-                text = await response.text()
+        data, update_access_token_flag, user_info = await self._kis_get_json(
+            url,
+            headers,
+            params,
+            user_info,
+            endpoint="profit-ratio",
+            symbol=symbol,
+        )
+        api_output = ((data or {}).get("output") or [])[:4]
+        n = len(api_output)
 
-                update_access_token_flag = False
-                if status_code in (401, 403, 500) and ("기간이 만료된 token" in text or "유효하지 않은 token" in text):
-                    user_info['kis_access_token'] = await get_access_token(user_info['kis_app_key'], user_info['kis_app_secret'])
-                    update_access_token_flag = True
+        if n == 0:
+            return 0.0, [], update_access_token_flag, user_info
 
-                    headers["authorization"] = (
-                        f"Bearer {user_info['kis_access_token']}"
-                    )
-                    await self._throttle()
-                    async with session.get(
-                        url, headers=headers, params=params
-                    ) as res_refresh:
-                        status_code = res_refresh.status
-                        text = await res_refresh.text()
+        df = pd.DataFrame(api_output)
+        cols = ["cptl_ntin_rate","self_cptl_ntin_inrt","sale_ntin_rate","sale_totl_rate"]
+        
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            min_value = df[c].min()
+            max_value = df[c].max() if df[c].max() > min_value else min_value + 1
+            df[c] = (df[c] - min_value) / (max_value - min_value)
 
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    logger.warning(
-                        "KIS profit-ratio JSON parse failed: symbol=%s status=%s text=%s",
-                        symbol,
-                        status_code,
-                        text[:200],
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        weights = [0.5, 0.3, 0.15, 0.05]
+        if n < 4:
+            weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
+        df["StabilityScore"] = df[cols].mean(axis=1)
+        df["weight"] = weights
+        df["weighted_score"] = df["StabilityScore"] * df["weight"]
+        final_score = df["weighted_score"].sum()
 
-                if data.get("rt_cd") != "0":
-                    logger.warning(
-                        "KIS profit-ratio API error: symbol=%s rt_cd=%s msg1=%s",
-                        symbol,
-                        data.get("rt_cd"),
-                        data.get("msg1"),
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
-
-                api_output = (data.get("output") or [])[:4]
-                n = len(api_output)
-
-                if n == 0:
-                    logger.warning("KIS profit-ratio empty output: symbol=%s", symbol)
-                    return 0.0, [], update_access_token_flag, user_info
-
-                df = pd.DataFrame(api_output)
-                cols = ["cptl_ntin_rate","self_cptl_ntin_inrt","sale_ntin_rate","sale_totl_rate"]
-                
-                for c in cols:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                    min_value = df[c].min()
-                    max_value = df[c].max() if df[c].max() > min_value else min_value + 1
-                    df[c] = (df[c] - min_value) / (max_value - min_value)
-
-                weights = [0.5, 0.3, 0.15, 0.05]
-                if n < 4:
-                    weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
-                df["StabilityScore"] = df[cols].mean(axis=1)
-                df["weight"] = weights
-                df["weighted_score"] = df["StabilityScore"] * df["weight"]
-                final_score = df["weighted_score"].sum()
-
-                return final_score, api_output, update_access_token_flag, user_info
+        return final_score, api_output, update_access_token_flag, user_info
 
     async def get_growth_ratio(self, symbol: str, div_cd: str = "1", user_info=None):
         """성장성 비율 조회"""
@@ -599,73 +625,39 @@ class PortfolioAnalysisTool(BaseTool):
             "fid_cond_mrkt_div_code": 'J'
         }
 
-        async with aiohttp.ClientSession() as session:
-            await self._throttle()
-            async with session.get(url, headers=headers, params=params) as response:
-                status_code = response.status
-                text = await response.text()
+        data, update_access_token_flag, user_info = await self._kis_get_json(
+            url,
+            headers,
+            params,
+            user_info,
+            endpoint="growth-ratio",
+            symbol=symbol,
+        )
+        api_output = ((data or {}).get("output") or [])[:4]
+        n = len(api_output)
 
-                update_access_token_flag = False
-                if status_code in (401, 403, 500) and ("기간이 만료된 token" in text or "유효하지 않은 token" in text):
-                    user_info['kis_access_token'] = await get_access_token(user_info['kis_app_key'], user_info['kis_app_secret'])
-                    update_access_token_flag = True
+        if n == 0:
+            return 0.0, [], update_access_token_flag, user_info
 
-                    headers["authorization"] = (
-                        f"Bearer {user_info['kis_access_token']}"
-                    )
-                    await self._throttle()
-                    async with session.get(
-                        url, headers=headers, params=params
-                    ) as res_refresh:
-                        status_code = res_refresh.status
-                        text = await res_refresh.text()
+        df = pd.DataFrame(api_output)
+        cols = ["grs","bsop_prfi_inrt","equt_inrt","totl_aset_inrt"] # 매출액 증가율, 영업 이익 증가율, 자기자본 증가율, 총자산 증가율
+        
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            min_value = df[c].min()
+            max_value = df[c].max() if df[c].max() > min_value else min_value + 1
+            df[c] = (df[c] - min_value) / (max_value - min_value)
 
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    logger.warning(
-                        "KIS growth-ratio JSON parse failed: symbol=%s status=%s text=%s",
-                        symbol,
-                        status_code,
-                        text[:200],
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        weights = [0.5, 0.3, 0.15, 0.05]
+        if n < 4:
+            weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
 
-                if data.get("rt_cd") != "0":
-                    logger.warning(
-                        "KIS growth-ratio API error: symbol=%s rt_cd=%s msg1=%s",
-                        symbol,
-                        data.get("rt_cd"),
-                        data.get("msg1"),
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        df["StabilityScore"] = df[cols].mean(axis=1)
+        df["weight"] = weights
+        df["weighted_score"] = df["StabilityScore"] * df["weight"]
+        final_score = df["weighted_score"].sum()
 
-                api_output = (data.get("output") or [])[:4]
-                n = len(api_output)
-
-                if n == 0:
-                    logger.warning("KIS growth-ratio empty output: symbol=%s", symbol)
-                    return 0.0, [], update_access_token_flag, user_info
-
-                df = pd.DataFrame(api_output)
-                cols = ["grs","bsop_prfi_inrt","equt_inrt","totl_aset_inrt"] # 매출액 증가율, 영업 이익 증가율, 자기자본 증가율, 총자산 증가율
-                
-                for c in cols:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                    min_value = df[c].min()
-                    max_value = df[c].max() if df[c].max() > min_value else min_value + 1
-                    df[c] = (df[c] - min_value) / (max_value - min_value)
-
-                weights = [0.5, 0.3, 0.15, 0.05]
-                if n < 4:
-                    weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
-
-                df["StabilityScore"] = df[cols].mean(axis=1)
-                df["weight"] = weights
-                df["weighted_score"] = df["StabilityScore"] * df["weight"]
-                final_score = df["weighted_score"].sum()
-
-                return final_score, api_output, update_access_token_flag, user_info
+        return final_score, api_output, update_access_token_flag, user_info
 
     async def get_major_ratio(self, symbol: str, div_cd: str = "1", user_info=None):
         """기타 주요 비율 조회"""
@@ -677,72 +669,38 @@ class PortfolioAnalysisTool(BaseTool):
             "fid_cond_mrkt_div_code": 'J'
         }
 
-        async with aiohttp.ClientSession() as session:
-            await self._throttle()
-            async with session.get(url, headers=headers, params=params) as response:
-                status_code = response.status
-                text = await response.text()
+        data, update_access_token_flag, user_info = await self._kis_get_json(
+            url,
+            headers,
+            params,
+            user_info,
+            endpoint="other-major-ratios",
+            symbol=symbol,
+        )
+        api_output = ((data or {}).get("output") or [])[:4]
+        n = len(api_output)
 
-                update_access_token_flag = False
-                if status_code in (401, 403, 500) and ("기간이 만료된 token" in text or "유효하지 않은 token" in text):
-                    user_info['kis_access_token'] = await get_access_token(user_info['kis_app_key'], user_info['kis_app_secret'])
-                    update_access_token_flag = True
+        if n == 0:
+            return 0.0, [], update_access_token_flag, user_info
 
-                    headers["authorization"] = (
-                        f"Bearer {user_info['kis_access_token']}"
-                    )
-                    await self._throttle()
-                    async with session.get(
-                        url, headers=headers, params=params
-                    ) as res_refresh:
-                        status_code = res_refresh.status
-                        text = await res_refresh.text()
+        df = pd.DataFrame(api_output)
+        cols = ["payout_rate","eva","ebitda","ev_ebitda"] # 배당 성향, EVA, EBITDA, EV_EBITDA
+        
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            min_value = df[c].min()
+            max_value = df[c].max() if df[c].max() > min_value else min_value + 1
+            df[c] = (df[c] - min_value) / (max_value - min_value)
 
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    logger.warning(
-                        "KIS major-ratio JSON parse failed: symbol=%s status=%s text=%s",
-                        symbol,
-                        status_code,
-                        text[:200],
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        weights = [0.5, 0.3, 0.15, 0.05]
+        if n < 4:
+            weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
+        df["StabilityScore"] = df[cols].mean(axis=1)
+        df["weight"] = weights
+        df["weighted_score"] = df["StabilityScore"] * df["weight"]
+        final_score = df["weighted_score"].sum()
 
-                if data.get("rt_cd") != "0":
-                    logger.warning(
-                        "KIS major-ratio API error: symbol=%s rt_cd=%s msg1=%s",
-                        symbol,
-                        data.get("rt_cd"),
-                        data.get("msg1"),
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
-
-                api_output = (data.get("output") or [])[:4]
-                n = len(api_output)
-
-                if n == 0:
-                    logger.warning("KIS major-ratio empty output: symbol=%s", symbol)
-                    return 0.0, [], update_access_token_flag, user_info
-
-                df = pd.DataFrame(api_output)
-                cols = ["payout_rate","eva","ebitda","ev_ebitda"] # 배당 성향, EVA, EBITDA, EV_EBITDA
-                
-                for c in cols:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                    min_value = df[c].min()
-                    max_value = df[c].max() if df[c].max() > min_value else min_value + 1
-                    df[c] = (df[c] - min_value) / (max_value - min_value)
-
-                weights = [0.5, 0.3, 0.15, 0.05]
-                if n < 4:
-                    weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
-                df["StabilityScore"] = df[cols].mean(axis=1)
-                df["weight"] = weights
-                df["weighted_score"] = df["StabilityScore"] * df["weight"]
-                final_score = df["weighted_score"].sum()
-
-                return final_score, api_output, update_access_token_flag, user_info
+        return final_score, api_output, update_access_token_flag, user_info
 
     async def get_financial_ratio(self, symbol: str, div_cd: str = "1", user_info=None):
         """재무 비율 조회"""
@@ -754,73 +712,39 @@ class PortfolioAnalysisTool(BaseTool):
             "fid_cond_mrkt_div_code": 'J'
         }
 
-        async with aiohttp.ClientSession() as session:
-            await self._throttle()
-            async with session.get(url, headers=headers, params=params) as response:
-                status_code = response.status
-                text = await response.text()
+        data, update_access_token_flag, user_info = await self._kis_get_json(
+            url,
+            headers,
+            params,
+            user_info,
+            endpoint="financial-ratio",
+            symbol=symbol,
+        )
+        api_output = ((data or {}).get("output") or [])[:4]
+        n = len(api_output)
 
-                update_access_token_flag = False
-                if status_code in (401, 403, 500) and ("기간이 만료된 token" in text or "유효하지 않은 token" in text):
-                    user_info['kis_access_token'] = await get_access_token(user_info['kis_app_key'], user_info['kis_app_secret'])
-                    update_access_token_flag = True
+        if n == 0:
+            return 0.0, [], update_access_token_flag, user_info
 
-                    headers["authorization"] = (
-                        f"Bearer {user_info['kis_access_token']}"
-                    )
-                    await self._throttle()
-                    async with session.get(
-                        url, headers=headers, params=params
-                    ) as res_refresh:
-                        status_code = res_refresh.status
-                        text = await res_refresh.text()
+        df = pd.DataFrame(api_output)
+        cols = ["grs","bsop_prfi_inrt","ntin_inrt","roe_val", "eps", "sps", "bps", "rsrv_rate", "lblt_rate"] # 매출액 증가율, 영업이익증가율, 순이익증가율, ROE, EPS, 주당매출액, BPS, 유보비율, 부채비율
+        
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            min_value = df[c].min()
+            max_value = df[c].max() if df[c].max() > min_value else min_value + 1
+            df[c] = (df[c] - min_value) / (max_value - min_value)
 
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    logger.warning(
-                        "KIS financial-ratio JSON parse failed: symbol=%s status=%s text=%s",
-                        symbol,
-                        status_code,
-                        text[:200],
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        weights = [0.5, 0.3, 0.15, 0.05]
+        if n < 4:
+            weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
 
-                if data.get("rt_cd") != "0":
-                    logger.warning(
-                        "KIS financial-ratio API error: symbol=%s rt_cd=%s msg1=%s",
-                        symbol,
-                        data.get("rt_cd"),
-                        data.get("msg1"),
-                    )
-                    return 0.0, [], update_access_token_flag, user_info
+        df["StabilityScore"] = df[cols].mean(axis=1)
+        df["weight"] = weights
+        df["weighted_score"] = df["StabilityScore"] * df["weight"]
+        final_score = df["weighted_score"].sum()
 
-                api_output = (data.get("output") or [])[:4]
-                n = len(api_output)
-
-                if n == 0:
-                    logger.warning("KIS financial-ratio empty output: symbol=%s", symbol)
-                    return 0.0, [], update_access_token_flag, user_info
-
-                df = pd.DataFrame(api_output)
-                cols = ["grs","bsop_prfi_inrt","ntin_inrt","roe_val", "eps", "sps", "bps", "rsrv_rate", "lblt_rate"] # 매출액 증가율, 영업이익증가율, 순이익증가율, ROE, EPS, 주당매출액, BPS, 유보비율, 부채비율
-                
-                for c in cols:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                    min_value = df[c].min()
-                    max_value = df[c].max() if df[c].max() > min_value else min_value + 1
-                    df[c] = (df[c] - min_value) / (max_value - min_value)
-
-                weights = [0.5, 0.3, 0.15, 0.05]
-                if n < 4:
-                    weights = weights[:n] + [0] * (n - len(weights))  # 부족한 부분은 0으로 채움
-
-                df["StabilityScore"] = df[cols].mean(axis=1)
-                df["weight"] = weights
-                df["weighted_score"] = df["StabilityScore"] * df["weight"]
-                final_score = df["weighted_score"].sum()
-
-                return final_score, api_output, update_access_token_flag, user_info
+        return final_score, api_output, update_access_token_flag, user_info
 
     async def analyze_stock(self, symbol: str, user_info: dict, risk_level: str):
         should_update_access_token = False

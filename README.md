@@ -104,6 +104,9 @@ OPENROUTER_API_KEY=
 
 # (선택) KIS 호출 Rate Limit (초당 최대 요청 수)
 KIS_MAX_REQUESTS_PER_SECOND=20
+
+# (추천/분석 전용) KIS 호출 RPS 제한 (모의투자는 특히 낮게 권장: 1~2)
+KIS_ANALYSIS_MAX_REQUESTS_PER_SECOND=1
 ```
 
 ## 🚀 빠른 시작

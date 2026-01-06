@@ -27,6 +27,8 @@ services:
       STOCKELPER_WEB_SCHEMA: ${STOCKELPER_WEB_SCHEMA:-public}
 
       KIS_MAX_REQUESTS_PER_SECOND: ${KIS_MAX_REQUESTS_PER_SECOND:-20}
+      # (추천/분석 전용) KIS 호출 RPS 제한 (모의투자는 특히 낮게 권장: 1~2)
+      KIS_ANALYSIS_MAX_REQUESTS_PER_SECOND: ${KIS_ANALYSIS_MAX_REQUESTS_PER_SECOND:-1}
 
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:21008/health || exit 1"]
