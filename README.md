@@ -138,8 +138,9 @@ curl -X POST http://localhost:21008/portfolio/recommendations \
   -d '{"user_id": 1}'
 ```
 
-- 응답에는 `id`(PK)와 `job_id`(UUID)가 포함되며,
-  추천 결과는 DB의 `public.portfolio_recommendations` 테이블에 적재됩니다.
+- 응답에는 `id`(PK)와 `job_id`(UUID)가 포함됩니다.
+- 서버는 요청을 받는 즉시 `public.portfolio_recommendations`에 **빈 레코드(placeholder)** 를 먼저 저장한 뒤,
+  추천 생성이 완료되면 해당 레코드를 업데이트합니다.
 
 ### 매수 워크플로우
 

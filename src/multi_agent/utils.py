@@ -4,10 +4,11 @@ import asyncio
 import json
 import os
 import uuid
-from datetime import datetime
+import re
 from typing import Any, Optional
 
 import aiohttp
+import asyncpg
 import requests
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -130,36 +131,86 @@ async def get_user_survey_answer(async_engine: object, user_id: int) -> Optional
             return None
 
 
-async def insert_portfolio_recommendation(
-    async_engine: object,
-    user_id: int,
-    investor_type: str,
-    result: str,
-) -> dict:
-    """public.portfolio_recommendations에 추천 결과를 적재합니다.
+_SCHEMA_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-    - job_id는 UUID4를 새로 생성해 부여합니다.
-    - id(PK)도 UUID4로 생성해 저장합니다.
+
+def _get_stockelper_schema() -> str:
+    schema = os.getenv("STOCKELPER_WEB_SCHEMA", "public")
+    if not _SCHEMA_NAME_RE.match(schema):
+        raise ValueError(f"Invalid STOCKELPER_WEB_SCHEMA: {schema!r}")
+    return schema
+
+
+def _get_database_url_for_asyncpg() -> str:
+    # 요구사항: DATABASE_URL의 stockelper_web DB를 사용
+    url = os.getenv("DATABASE_URL") or os.getenv("ASYNC_DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL 또는 ASYNC_DATABASE_URL 이 설정되어 있지 않습니다.")
+
+    # asyncpg는 postgresql+asyncpg 스킴을 이해하지 못하므로 변환
+    if url.startswith("postgresql+asyncpg://"):
+        url = url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    return url
+
+
+async def create_portfolio_recommendation_job(user_id: int) -> dict:
+    """요청 수신 즉시 '빈' 레코드를 먼저 생성합니다.
+
+    DB 제약상 investor_type/result가 NOT NULL이라, 빈 문자열로 초기화합니다.
+    - id: UUID4 (PK)
+    - job_id: UUID4 (요구사항)
     """
     rec_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
-    now = datetime.utcnow()  # DB 컬럼이 timestamp without time zone 이므로 naive UTC 사용
+    schema = _get_stockelper_schema()
+    dsn = _get_database_url_for_asyncpg()
 
-    async with AsyncSession(async_engine) as session:
-        session.add(
-            PortfolioRecommendation(
-                id=rec_id,
-                job_id=job_id,
-                user_id=user_id,
-                investor_type=investor_type,
-                result=result,
-                created_at=now,
-                updated_at=now,
-            )
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(
+            f"""
+            INSERT INTO {schema}.portfolio_recommendations
+              (id, user_id, investor_type, result, updated_at, job_id)
+            VALUES
+              ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5)
+            """,
+            rec_id,
+            user_id,
+            "",
+            "",
+            job_id,
         )
-        await session.commit()
+    finally:
+        await conn.close()
 
     return {"id": rec_id, "job_id": job_id}
+
+
+async def update_portfolio_recommendation_job(
+    rec_id: str, investor_type: str, result: str
+) -> bool:
+    """추천 결과 생성 완료 후, 최초 생성한 레코드를 업데이트합니다."""
+    schema = _get_stockelper_schema()
+    dsn = _get_database_url_for_asyncpg()
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        res = await conn.execute(
+            f"""
+            UPDATE {schema}.portfolio_recommendations
+            SET investor_type = $2,
+                result = $3,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            """,
+            rec_id,
+            investor_type,
+            result,
+        )
+        # 예: "UPDATE 1"
+        return str(res).strip().endswith("1")
+    finally:
+        await conn.close()
 
 
 # =====================

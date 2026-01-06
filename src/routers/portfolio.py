@@ -10,9 +10,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from multi_agent.portfolio_analysis_agent.tools.portfolio import PortfolioAnalysisTool
 from multi_agent.utils import (
+    create_portfolio_recommendation_job,
     get_user_survey_answer,
-    insert_portfolio_recommendation,
     survey_answer_to_investor_type,
+    update_portfolio_recommendation_job,
 )
 from portfolio_multi_agent.builder import build_buy_workflow, build_sell_workflow
 from portfolio_multi_agent.state import BuyInputState, SellInputState
@@ -72,33 +73,47 @@ class PortfolioRecommendationRequest(BaseModel):
 async def recommend_portfolio(body: PortfolioRecommendationRequest):
     engine = _get_engine()
 
-    survey_answer = await get_user_survey_answer(engine, body.user_id)
-    if not survey_answer:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="설문 정보(survey.answer)가 없습니다. 먼저 설문을 완료해주세요.",
+    # 1) 요청을 받는 순간 "빈" 레코드를 먼저 생성 (job_id UUID 생성)
+    job = await create_portfolio_recommendation_job(body.user_id)
+    rec_id = job["id"]
+    job_id = job["job_id"]
+
+    investor_type: str = ""
+    result: str = ""
+
+    try:
+        # 2) 설문 기반 투자성향 산출
+        survey_answer = await get_user_survey_answer(engine, body.user_id)
+        if not survey_answer:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="설문 정보(survey.answer)가 없습니다. 먼저 설문을 완료해주세요.",
+            )
+        investor_type = survey_answer_to_investor_type(survey_answer)
+
+        # 3) 포트폴리오 추천 생성
+        tool = PortfolioAnalysisTool()
+        result = await tool.ainvoke(
+            {"user_investor_type": investor_type},
+            config={"configurable": {"user_id": body.user_id}},
         )
-    investor_type = survey_answer_to_investor_type(survey_answer)
 
-    tool = PortfolioAnalysisTool()
-    result = await tool.ainvoke(
-        {"user_investor_type": investor_type},
-        config={"configurable": {"user_id": body.user_id}},
-    )
+        # 4) 결과 생성 완료 후, 최초 레코드를 업데이트
+        await update_portfolio_recommendation_job(rec_id, investor_type, result)
+    except Exception as e:
+        # 실패하더라도 DB에 "빈 레코드"만 남지 않도록 에러를 적재(최선 시도)
+        try:
+            detail = str(e)
+            if isinstance(e, HTTPException):
+                detail = str(e.detail)
+            await update_portfolio_recommendation_job(
+                rec_id, investor_type or "", f"ERROR: {detail}"
+            )
+        except Exception:
+            pass
+        raise
 
-    saved = await insert_portfolio_recommendation(
-        engine,
-        user_id=body.user_id,
-        investor_type=investor_type,
-        result=result,
-    )
-
-    return {
-        "id": saved["id"],
-        "job_id": saved["job_id"],
-        "investor_type": investor_type,
-        "result": result,
-    }
+    return {"id": rec_id, "job_id": job_id, "investor_type": investor_type, "result": result}
 
 
 @router.post("/buy", status_code=status.HTTP_200_OK)

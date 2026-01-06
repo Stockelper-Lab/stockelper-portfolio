@@ -39,13 +39,22 @@ def test_portfolio_recommendations_mocked(monkeypatch):
         lambda answer: "안정형",
         raising=True,
     )
-    async def fake_insert_portfolio_recommendation(*args, **kwargs):  # noqa: ANN001
+    async def fake_create_job(user_id):  # noqa: ANN001
         return {"id": "test-id", "job_id": "test-job-id"}
+
+    async def fake_update_job(rec_id, investor_type, result):  # noqa: ANN001
+        return True
 
     monkeypatch.setattr(
         portfolio_router,
-        "insert_portfolio_recommendation",
-        fake_insert_portfolio_recommendation,
+        "create_portfolio_recommendation_job",
+        fake_create_job,
+        raising=True,
+    )
+    monkeypatch.setattr(
+        portfolio_router,
+        "update_portfolio_recommendation_job",
+        fake_update_job,
         raising=True,
     )
 
