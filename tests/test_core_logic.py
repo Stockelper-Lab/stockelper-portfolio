@@ -116,5 +116,10 @@ def test_portfolio_analysis_recommendation_postprocess():
     # 반올림 때문에 100에서 약간 어긋날 수 있음
     assert abs(sum(weights) - 100.0) <= 0.2
 
+    # 요청 개수 오버라이드: 2개로 강제
+    rec2 = tool._build_portfolio_recommendation(sample, "안정형", portfolio_size=2)
+    assert rec2["portfolio_size"] == 2
+    assert len(rec2["recommendations"]) == 2
+
 
 

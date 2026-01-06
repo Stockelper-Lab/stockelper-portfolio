@@ -135,12 +135,13 @@ docker-compose logs -f stockelper-portfolio-server
 ```bash
 curl -X POST http://localhost:21008/portfolio/recommendations \
   -H "Content-Type: application/json" \
-  -d '{"user_id": 1}'
+  -d '{"user_id": 1, "portfolio_size": 10}'
 ```
 
 - 응답에는 `id`(PK)와 `job_id`(UUID)가 포함됩니다.
 - 서버는 요청을 받는 즉시 `public.portfolio_recommendations`에 **빈 레코드(placeholder)** 를 먼저 저장한 뒤,
   추천 생성이 완료되면 해당 레코드를 업데이트합니다.
+- `result`는 **보고서 형태(Markdown)** 로 저장되며, 기보유 종목이 있으면 이를 포함하고 추천 프로세스 요약과 최종 포트폴리오를 구조화해 제공합니다.
 
 ### 매수 워크플로우
 

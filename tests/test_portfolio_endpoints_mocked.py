@@ -61,7 +61,7 @@ def test_portfolio_recommendations_mocked(monkeypatch):
     client = TestClient(app)
     res = client.post(
         "/portfolio/recommendations",
-        json={"user_id": 1},
+        json={"user_id": 1, "portfolio_size": 10},
     )
     assert res.status_code == 200
     payload = res.json()

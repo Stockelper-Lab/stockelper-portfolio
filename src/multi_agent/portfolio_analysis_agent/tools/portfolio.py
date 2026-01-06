@@ -19,6 +19,7 @@ import os
 import asyncio
 import json
 import OpenDartReader
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,12 @@ class PortfolioAnalysisInput(BaseModel):
     user_investor_type: str = Field(
         description="The investor type of the user. It indicates the user's investment style or risk profile."
     )
+    portfolio_size: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description="추천받을 종목 개수(1~20). 지정하지 않으면 투자성향 기본값을 사용합니다.",
+    )
 
 class PortfolioAnalysisTool(BaseTool):
     name: str = "portfolio_analysis"
@@ -126,6 +133,124 @@ class PortfolioAnalysisTool(BaseTool):
         }
         logger.debug("Headers created: %s", headers)
         return headers
+
+    def _get_kis_trading_id(self) -> str:
+        """KIS 계좌 조회/주문 등 trading API용 tr_id를 반환합니다.
+
+        - 모의투자(openapivts): VTTC8434R
+        - 실전(openapi): TTTC8434R
+        """
+        base = (self.url_base or "").lower()
+        if "openapivts" in base:
+            return "VTTC8434R"
+        return "TTTC8434R"
+
+    async def get_user_holdings(self, user_info: dict) -> dict:
+        """유저의 기보유 종목(계좌 보유 현황)을 조회합니다.
+
+        Returns:
+            {
+              "holdings": [ {code,name,quantity,avg_buy_price,current_price,return_rate,evaluated_amount,profit_loss}, ... ],
+              "summary": { ... } | None
+            }
+        """
+        account_no = user_info.get("account_no") or ""
+        if "-" not in account_no:
+            raise ValueError("account_no 형식이 올바르지 않습니다. (예: 12345678-01)")
+
+        url = self.url_base + "/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = {
+            "Content-Type": "application/json",
+            "authorization": f"Bearer {user_info['kis_access_token']}",
+            "appkey": user_info["kis_app_key"],
+            "appsecret": user_info["kis_app_secret"],
+            "tr_id": self._get_kis_trading_id(),
+            "custtype": "P",
+        }
+        params = {
+            "CANO": account_no.split("-")[0],
+            "ACNT_PRDT_CD": account_no.split("-")[1],
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "01",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await self._throttle()
+            async with session.get(url, headers=headers, params=params) as response:
+                text = await response.text()
+                try:
+                    res_data = json.loads(text)
+                except Exception:
+                    raise ValueError(f"KIS holdings 응답 파싱 실패: {text[:200]}")
+
+                if res_data.get("rt_cd") != "0":
+                    raise ValueError(
+                        f"KIS holdings API 오류: {res_data.get('msg1', '알 수 없는 오류')}"
+                    )
+
+                holdings = []
+                for item in res_data.get("output1", []) or []:
+                    try:
+                        quantity = int(item.get("hldg_qty", "0"))
+                    except Exception:
+                        quantity = 0
+                    if quantity <= 0:
+                        continue
+
+                    code = str(item.get("pdno", "") or "")
+                    name = str(item.get("prdt_name", "") or "")
+                    try:
+                        avg_buy_price = float(item.get("pchs_avg_pric", "0") or 0)
+                    except Exception:
+                        avg_buy_price = 0.0
+                    try:
+                        current_price = float(item.get("prpr", "0") or 0)
+                    except Exception:
+                        current_price = 0.0
+                    try:
+                        evaluated_amount = float(item.get("evlu_amt", "0") or 0)
+                    except Exception:
+                        evaluated_amount = 0.0
+                    try:
+                        profit_loss = float(item.get("evlu_pfls_amt", "0") or 0)
+                    except Exception:
+                        profit_loss = 0.0
+
+                    return_rate = (
+                        (current_price - avg_buy_price) / avg_buy_price
+                        if avg_buy_price > 0
+                        else 0.0
+                    )
+                    holdings.append(
+                        {
+                            "code": code,
+                            "name": name,
+                            "quantity": quantity,
+                            "avg_buy_price": avg_buy_price,
+                            "current_price": current_price,
+                            "return_rate": return_rate,
+                            "evaluated_amount": evaluated_amount,
+                            "profit_loss": profit_loss,
+                        }
+                    )
+
+                summary = None
+                try:
+                    out2 = (res_data.get("output2") or [])
+                    if out2:
+                        summary = dict(out2[0])
+                except Exception:
+                    summary = None
+
+                return {"holdings": holdings, "summary": summary}
 
     def _ensure_dart_client(self):
         """DART 클라이언트/락을 지연 초기화합니다.
@@ -612,13 +737,30 @@ class PortfolioAnalysisTool(BaseTool):
 
         return analysis_result, should_update_access_token
 
-    async def analyze_portfolio(self, risk_level: str, user_info: dict, top_n: int = 30) -> Dict:
+    async def analyze_portfolio(
+        self,
+        risk_level: str,
+        user_info: dict,
+        top_n: int = 30,
+        portfolio_size: Optional[int] = None,
+    ) -> Dict:
         """
         투자 성향에 따른 포트폴리오 분석 및 추천
 
         risk_level: "안정형" | "안정추구형" | "위험중립형" | "적극투자형" | "공격투자형"
         """
         logger.info("Analyzing portfolio for risk level: %s with top N: %d", risk_level, top_n)
+        # 0. 기보유 종목 조회(가능하면)
+        holdings_payload: dict | None = None
+        try:
+            holdings_payload = await self.get_user_holdings(user_info)
+        except Exception as e:
+            # holdings 조회 실패해도 추천 전체는 계속 진행
+            logger.warning("Failed to fetch user holdings; proceed without holdings. err=%s", e)
+
+        holdings_list = (holdings_payload or {}).get("holdings") or []
+        holdings_map = {h["code"]: h for h in holdings_list if h.get("code")}
+
         # 1. 시가총액 상위 종목 조회
         ranking, update_access_token_flag, user_info = await self.get_top_market_value(fid_rank_sort_cls_code='23', user_info=user_info)
         portfolio_data = []
@@ -626,16 +768,38 @@ class PortfolioAnalysisTool(BaseTool):
 
         tasks = []
         # 2. 각 종목별 지표 분석
+        # - 후보군: 시가총액 상위(top_n) + 기보유 종목(중복 제거)
+        candidate_symbols: list[str] = []
+        seen: set[str] = set()
+
         for item in ranking[:top_n]:
             symbol = item.get("mksc_shrn_iscd")
             if not symbol:
                 logger.warning("No symbol found for item: %s", item)
                 continue
+            symbol = str(symbol)
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            candidate_symbols.append(symbol)
+
+        for code in holdings_map.keys():
+            if code in seen:
+                continue
+            seen.add(code)
+            candidate_symbols.append(code)
+
+        for symbol in candidate_symbols:
             tasks.append(self.analyze_stock(symbol, user_info, risk_level))
 
         results = await asyncio.gather(*tasks)
         for analysis_result, flag in results:
             should_update_access_token |= flag
+            sym = str(analysis_result.get("symbol", "") or "")
+            is_holding = sym in holdings_map
+            analysis_result["is_holding"] = is_holding
+            if is_holding:
+                analysis_result["holding"] = holdings_map.get(sym)
             portfolio_data.append(analysis_result)
 
         logger.info("Portfolio analysis completed. Total stocks analyzed: %d", len(portfolio_data))
@@ -653,7 +817,80 @@ class PortfolioAnalysisTool(BaseTool):
                     "Failed to persist refreshed KIS access token to DB: %s",
                     e,
                 )
-        return self._build_portfolio_recommendation(portfolio_data, risk_level)
+        rec = self._build_portfolio_recommendation_with_holdings(
+            portfolio_data,
+            risk_level,
+            holdings_map=holdings_map,
+            portfolio_size=portfolio_size,
+        )
+
+        # 보고서용 메타/기보유 종목 포함
+        rec["holdings"] = holdings_list
+        rec["holdings_summary"] = (holdings_payload or {}).get("summary")
+
+        # 기보유 종목이 최종 추천에 포함됐는지 표시
+        rec_codes = {x.get("symbol") for x in rec.get("recommendations", [])}
+        rec["holdings_included"] = [h for h in holdings_list if h.get("code") in rec_codes]
+        rec["holdings_excluded"] = [h for h in holdings_list if h.get("code") not in rec_codes]
+        rec["analysis_universe_size"] = len(candidate_symbols)
+        rec["analysis_top_n_market_cap"] = top_n
+
+        return rec
+
+    def _build_portfolio_recommendation_with_holdings(
+        self,
+        data: List[Dict],
+        risk_level: str,
+        holdings_map: dict[str, dict] | None = None,
+        portfolio_size: Optional[int] = None,
+    ) -> Dict:
+        """기보유 종목을 '기준'으로 최종 포트폴리오를 구성합니다.
+
+        정책:
+        - 기보유 종목이 있고, (보유 종목 수 <= 목표 개수)면: **보유 종목 전부 유지 + 부족분만 신규 추천**
+        - 보유 종목 수가 목표 개수보다 많으면: 보유 종목 중 종합점수 상위 N개로 축소
+        - 보유 종목이 없으면: 기존 로직(상위 N개)과 동일
+        """
+        holdings_map = holdings_map or {}
+
+        # 기본 로직으로 target_size 계산(성향별 default 포함)
+        base = self._build_portfolio_recommendation(
+            data, risk_level, portfolio_size=portfolio_size
+        )
+        target_size = int(base.get("portfolio_size", 0) or 0)
+        if target_size <= 0:
+            return base
+
+        sorted_data = sorted(data, key=lambda x: x["total_score"], reverse=True)
+        if not sorted_data:
+            return {"risk_level": risk_level, "portfolio_size": 0, "recommendations": []}
+
+        if not holdings_map:
+            return base
+
+        holding_items = [x for x in sorted_data if str(x.get("symbol", "")) in holdings_map]
+        new_items = [x for x in sorted_data if str(x.get("symbol", "")) not in holdings_map]
+
+        if len(holding_items) >= target_size:
+            final_items = holding_items[:target_size]
+        else:
+            need = target_size - len(holding_items)
+            final_items = holding_items + new_items[:need]
+
+        total_score = sum(item["total_score"] for item in final_items)
+        if total_score > 0:
+            for item in final_items:
+                item["weight"] = round(item["total_score"] / total_score * 100, 2)
+        else:
+            equal = round(100 / len(final_items), 2)
+            for item in final_items:
+                item["weight"] = equal
+
+        return {
+            "risk_level": risk_level,
+            "portfolio_size": len(final_items),
+            "recommendations": final_items,
+        }
 
     def _calculate_total_score(self, stability: float, profit: float, 
                              growth: float, major: float, fin: float, 
@@ -708,31 +945,49 @@ class PortfolioAnalysisTool(BaseTool):
             fin * weights["financial"]
         )
 
-    def _build_portfolio_recommendation(self, data: List[Dict], 
-                                      risk_level: str) -> Dict:
+    def _build_portfolio_recommendation(
+        self,
+        data: List[Dict],
+        risk_level: str,
+        portfolio_size: Optional[int] = None,
+    ) -> Dict:
         """투자 성향에 따른 포트폴리오 추천"""
         # 점수 기준 정렬
         sorted_data = sorted(data, key=lambda x: x["total_score"], reverse=True)
 
-        # 투자 성향별 포트폴리오 크기 설정
-        if risk_level == "위험중립형":
-            portfolio_size = 4
-        elif risk_level == "안정추구형":
-            portfolio_size = 3
-        elif risk_level == "안정형":
-            portfolio_size = 3
-        elif risk_level == "적극투자형":
-            portfolio_size = 5
-        else:  # 공격투자형
-            portfolio_size = 6
+        # 기본: 투자 성향별 포트폴리오 크기
+        if portfolio_size is None:
+            if risk_level == "위험중립형":
+                portfolio_size = 4
+            elif risk_level == "안정추구형":
+                portfolio_size = 3
+            elif risk_level == "안정형":
+                portfolio_size = 3
+            elif risk_level == "적극투자형":
+                portfolio_size = 5
+            else:  # 공격투자형
+                portfolio_size = 6
+
+        # 안전장치: 분석된 종목 수를 초과하면 가능한 만큼만
+        if not sorted_data:
+            return {"risk_level": risk_level, "portfolio_size": 0, "recommendations": []}
+
+        portfolio_size = max(1, int(portfolio_size))
+        portfolio_size = min(portfolio_size, len(sorted_data))
 
         # 상위 종목 선정
         recommended_portfolio = sorted_data[:portfolio_size]
 
         # 투자 비중 계산
         total_score = sum(item["total_score"] for item in recommended_portfolio)
-        for item in recommended_portfolio:
-            item["weight"] = round(item["total_score"] / total_score * 100, 2)
+        if total_score > 0:
+            for item in recommended_portfolio:
+                item["weight"] = round(item["total_score"] / total_score * 100, 2)
+        else:
+            # 점수가 모두 0이면 균등 분배
+            equal = round(100 / len(recommended_portfolio), 2)
+            for item in recommended_portfolio:
+                item["weight"] = equal
 
         return {
             "risk_level": risk_level,
@@ -741,24 +996,66 @@ class PortfolioAnalysisTool(BaseTool):
         }
 
     def _format_analysis_result_to_markdown(self, analysis_result: Dict) -> str:
-        """분석 결과를 한국어 마크다운 표로 변환"""
+        """분석 결과를 '보고서' 형태의 한국어 마크다운으로 변환"""
         risk_level = analysis_result.get("risk_level", "N/A")
         portfolio_size = analysis_result.get("portfolio_size", 0)
         recommendations = analysis_result.get("recommendations", [])
+        holdings = analysis_result.get("holdings", []) or []
+        holdings_included = analysis_result.get("holdings_included", []) or []
+        holdings_excluded = analysis_result.get("holdings_excluded", []) or []
+        universe_size = analysis_result.get("analysis_universe_size", None)
+        top_n_market_cap = analysis_result.get("analysis_top_n_market_cap", None)
+        generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         
-        # 마크다운 시작
-        markdown = "# 포트폴리오 분석 결과\n\n"
+        # 마크다운 시작(보고서)
+        markdown = "# 포트폴리오 추천 보고서\n\n"
+        markdown += f"- 생성 시각: {generated_at}\n"
+        markdown += f"- 투자 성향(설문 기반): **{risk_level}**\n"
+        markdown += f"- 최종 추천 종목 수: **{portfolio_size}개**\n"
+        if universe_size is not None and top_n_market_cap is not None:
+            markdown += f"- 분석 후보군: 시가총액 상위 {top_n_market_cap} + 기보유 종목 → **{universe_size}개**\n"
+        markdown += "\n---\n\n"
         
-        # 포트폴리오 개요
-        markdown += "## 📋 포트폴리오 개요\n"
-        markdown += f"- **투자 성향**: {risk_level}\n"
-        markdown += f"- **추천 종목 수**: {portfolio_size}개\n\n"
+        # 1) 기보유 종목 섹션
+        markdown += "## 1) 기보유 종목 현황\n\n"
+        if not holdings:
+            markdown += "- 현재 기보유 종목이 없거나, 계좌 조회 결과가 없습니다.\n\n"
+        else:
+            markdown += f"- 기보유 종목: **{len(holdings)}개**\n"
+            markdown += f"- 최종 추천 포트폴리오에 포함: **{len(holdings_included)}개**, 제외: **{len(holdings_excluded)}개**\n\n"
+
+            markdown += "| 종목명 | 종목코드 | 보유수량 | 평균단가 | 현재가 | 수익률 | 평가금액 | 평가손익 | 최종포트폴리오 |\n"
+            markdown += "|:---|:---:|---:|---:|---:|---:|---:|---:|:---:|\n"
+            included_codes = {h.get("code") for h in holdings_included}
+            for h in holdings:
+                name = h.get("name", "N/A")
+                code = h.get("code", "N/A")
+                qty = h.get("quantity", 0)
+                avgp = h.get("avg_buy_price", 0.0)
+                curp = h.get("current_price", 0.0)
+                rr = h.get("return_rate", 0.0)
+                eva = h.get("evaluated_amount", 0.0)
+                pnl = h.get("profit_loss", 0.0)
+                flag = "포함" if code in included_codes else "미포함"
+                markdown += (
+                    f"| {name} | {code} | {qty:,} | {avgp:,.0f} | {curp:,.0f} | {rr*100:.2f}% | {eva:,.0f} | {pnl:,.0f} | {flag} |\n"
+                )
+            markdown += "\n---\n\n"
+
+        # 2) 추천 프로세스 설명
+        markdown += "## 2) 추천 프로세스(요약)\n\n"
+        markdown += "- **투자 성향 산출**: `public.survey.answer(q1~q8)`를 점수화하여 투자 성향(안정형~공격투자형)을 결정합니다.\n"
+        markdown += "- **기보유 종목 반영**: 계좌 보유 종목을 조회한 뒤, **보유 종목을 최종 포트폴리오의 베이스로 포함**하고 부족분만 신규로 추천합니다.\n"
+        markdown += "  - 단, 보유 종목 수가 요청 개수보다 많으면 보유 종목 중 종합점수 상위 N개로 축소합니다.\n"
+        markdown += "- **후보군 구성**: 시가총액 상위 종목 + 기보유 종목을 합쳐 분석 후보군을 만듭니다.\n"
+        markdown += "- **지표 계산/스코어링**: 안정성/수익성/성장성/주요지표/재무비율 지표를 계산하고, 투자 성향별 가중치로 종합점수를 산출합니다.\n"
+        markdown += "- **최종 선정/비중 산출**: 종합점수 상위 **N개(요청 개수)**를 선정하고, 종합점수 비율로 투자 비중(%)을 계산합니다.\n\n"
         markdown += "---\n\n"
         
-        # 추천 종목 목록 표
-        markdown += "## 🎯 추천 종목 목록\n\n"
-        markdown += "| 순위 | 종목명 | 종목코드 | 업종 | 시장 | 투자비중 | 종합점수 | 안정성점수 | 수익성점수 | 성장성점수 |\n"
-        markdown += "|:---:|:---|:---:|:---|:---|---:|---:|---:|---:|---:|\n"
+        # 3) 최종 추천 포트폴리오(마지막)
+        markdown += "## 3) 최종 추천 포트폴리오\n\n"
+        markdown += "| 순위 | 구분 | 종목명 | 종목코드 | 업종 | 시장 | 투자비중 | 종합점수 | 안정성 | 수익성 | 성장성 |\n"
+        markdown += "|:---:|:---:|:---|:---:|:---|:---|---:|---:|---:|---:|---:|\n"
         
         for idx, stock in enumerate(recommendations, 1):
             name = stock.get("name", "N/A")
@@ -770,18 +1067,29 @@ class PortfolioAnalysisTool(BaseTool):
             stability_score = stock.get("stability_score", 0)
             profit_score = stock.get("profit_score", 0)
             growth_score = stock.get("growth_score", 0)
+            kind = "기보유" if stock.get("is_holding") else "신규"
             
-            markdown += f"| {idx} | {name} | {symbol} | {sector} | {market} | {weight}% | {total_score:.3f} | {stability_score:.3f} | {profit_score:.3f} | {growth_score:.3f} |\n"
+            markdown += (
+                f"| {idx} | {kind} | {name} | {symbol} | {sector} | {market} | {weight}% | "
+                f"{float(total_score):.3f} | {float(stability_score):.3f} | {float(profit_score):.3f} | {float(growth_score):.3f} |\n"
+            )
         
         return markdown
     
-    def _run(self, user_investor_type: str, config: RunnableConfig = None, run_manager: Optional[CallbackManagerForToolRun] = None) -> str:
-        return asyncio.run(self._arun(config, run_manager))
+    def _run(
+        self,
+        user_investor_type: str,
+        portfolio_size: Optional[int] = None,
+        config: RunnableConfig = None,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> str:
+        return asyncio.run(self._arun(user_investor_type, portfolio_size, config, run_manager))
 
 
     async def _arun(
         self, 
         user_investor_type: str,
+        portfolio_size: Optional[int] = None,
         config: RunnableConfig = None,
         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
     ) -> str:
@@ -823,7 +1131,12 @@ class PortfolioAnalysisTool(BaseTool):
                 logger.warning("Failed to persist issued KIS access token to DB: %s", e)
         
         # 포트폴리오 분석 실행
-        analysis_result = await self.analyze_portfolio(user_investor_type, user_info, top_n=20)
+        analysis_result = await self.analyze_portfolio(
+            user_investor_type,
+            user_info,
+            top_n=20,
+            portfolio_size=portfolio_size,
+        )
 
         # 마크다운 형식으로 변환하여 반환
         markdown_result = self._format_analysis_result_to_markdown(analysis_result)

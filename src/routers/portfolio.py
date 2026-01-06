@@ -67,6 +67,12 @@ def _get_sell_workflow():
 
 class PortfolioRecommendationRequest(BaseModel):
     user_id: int = Field(description="User ID")
+    portfolio_size: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description="추천 종목 개수(1~20). 채팅에서 '10개 종목 추천'처럼 요청하면 이 값이 전달됩니다.",
+    )
 
 
 @router.post("/recommendations", status_code=status.HTTP_200_OK)
@@ -94,7 +100,7 @@ async def recommend_portfolio(body: PortfolioRecommendationRequest):
         # 3) 포트폴리오 추천 생성
         tool = PortfolioAnalysisTool()
         result = await tool.ainvoke(
-            {"user_investor_type": investor_type},
+            {"user_investor_type": investor_type, "portfolio_size": body.portfolio_size},
             config={"configurable": {"user_id": body.user_id}},
         )
 
