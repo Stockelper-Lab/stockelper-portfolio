@@ -41,4 +41,5 @@ services:
 networks:
   stockelper:
     # 여러 레포(LLM/FE/Portfolio/Backtesting)를 같은 네트워크에 붙이기 위한 고정 이름
+    external: true
     name: stockelper
