@@ -368,7 +368,15 @@ def format_survey_answer_korean(answer: dict) -> str:
 
 async def get_access_token(app_key, app_secret):
     """접근 토큰(access token) 발급"""
-    url = "https://openapivts.koreainvestment.com:29443/oauth2/tokenP"
+    # KIS 모의/실전 환경에 따라 토큰 발급 URL이 다릅니다.
+    # - 기본값: 모의투자(openapivts)
+    # - 실전 환경을 쓰려면 KIS_OAUTH_BASE_URL 또는 KIS_API_BASE_URL을 openapi로 설정하세요.
+    base = (
+        os.getenv("KIS_OAUTH_BASE_URL")
+        or os.getenv("KIS_API_BASE_URL")
+        or "https://openapivts.koreainvestment.com:29443"
+    ).rstrip("/")
+    url = f"{base}/oauth2/tokenP"
     headers = {
         "content-type": "application/json"
     }

@@ -104,7 +104,10 @@ class PortfolioAnalysisInput(BaseModel):
 class PortfolioAnalysisTool(BaseTool):
     name: str = "portfolio_analysis"
     description: str = "Analyzes and recommends portfolio based on user's investor type. Evaluates stocks using market value, stability, profitability, and growth metrics, then suggests optimal portfolio composition tailored to the user's investment style."
-    url_base: str = "https://openapi.koreainvestment.com:9443"
+    # KIS 모의/실전 base URL
+    # - 기본값은 모의투자(openapivts)
+    # - 실전 환경은 KIS_API_BASE_URL=https://openapi.koreainvestment.com:9443 로 설정
+    url_base: str = os.getenv("KIS_API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
     args_schema: Type[BaseModel] = PortfolioAnalysisInput
 
     return_direct: bool = True
@@ -145,26 +148,19 @@ class PortfolioAnalysisTool(BaseTool):
             return "VTTC8434R"
         return "TTTC8434R"
 
-    async def get_user_holdings(self, user_info: dict) -> dict:
-        """유저의 기보유 종목(계좌 보유 현황)을 조회합니다.
-
-        Returns:
-            {
-              "holdings": [ {code,name,quantity,avg_buy_price,current_price,return_rate,evaluated_amount,profit_loss}, ... ],
-              "summary": { ... } | None
-            }
-        """
+    async def _fetch_user_holdings(self, base_url: str, tr_id: str, user_info: dict) -> dict:
+        """(내부) 특정 base_url/TR로 기보유 종목을 조회합니다."""
         account_no = user_info.get("account_no") or ""
         if "-" not in account_no:
             raise ValueError("account_no 형식이 올바르지 않습니다. (예: 12345678-01)")
 
-        url = self.url_base + "/uapi/domestic-stock/v1/trading/inquire-balance"
+        url = base_url.rstrip("/") + "/uapi/domestic-stock/v1/trading/inquire-balance"
         headers = {
             "Content-Type": "application/json",
             "authorization": f"Bearer {user_info['kis_access_token']}",
             "appkey": user_info["kis_app_key"],
             "appsecret": user_info["kis_app_secret"],
-            "tr_id": self._get_kis_trading_id(),
+            "tr_id": tr_id,
             "custtype": "P",
         }
         params = {
@@ -251,6 +247,47 @@ class PortfolioAnalysisTool(BaseTool):
                     summary = None
 
                 return {"holdings": holdings, "summary": summary}
+
+    async def get_user_holdings(self, user_info: dict) -> dict:
+        """유저의 기보유 종목(계좌 보유 현황)을 조회합니다.
+
+        Returns:
+            {
+              "holdings": [ {code,name,quantity,avg_buy_price,current_price,return_rate,evaluated_amount,profit_loss}, ... ],
+              "summary": { ... } | None
+            }
+        """
+        # 1) 현재 설정(base_url/tr_id)로 먼저 시도
+        base_url = self.url_base
+        tr_id = self._get_kis_trading_id()
+        try:
+            return await self._fetch_user_holdings(base_url, tr_id, user_info)
+        except Exception as e:
+            msg = str(e)
+
+            # 2) 환경(TR) 불일치 시 자동 폴백
+            # - "모의투자 TR 이 아닙니다." : 실전 TR을 모의 환경에 보낸 경우 → 모의 환경으로 재시도
+            # - "실전투자 TR 이 아닙니다." : 모의 TR을 실전 환경에 보낸 경우 → 실전 환경으로 재시도
+            if "모의투자 TR" in msg:
+                try:
+                    return await self._fetch_user_holdings(
+                        "https://openapivts.koreainvestment.com:29443",
+                        "VTTC8434R",
+                        user_info,
+                    )
+                except Exception:
+                    raise e
+            if "실전투자 TR" in msg:
+                try:
+                    return await self._fetch_user_holdings(
+                        "https://openapi.koreainvestment.com:9443",
+                        "TTTC8434R",
+                        user_info,
+                    )
+                except Exception:
+                    raise e
+
+            raise e
 
     def _ensure_dart_client(self):
         """DART 클라이언트/락을 지연 초기화합니다.
@@ -428,13 +465,32 @@ class PortfolioAnalysisTool(BaseTool):
                         status_code = res_refresh.status
                         text = await res_refresh.text()
 
-                data = json.loads(text)
-                api_output = data['output'][:4]
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning(
+                        "KIS stability-ratio JSON parse failed: symbol=%s status=%s text=%s",
+                        symbol,
+                        status_code,
+                        text[:200],
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                if data.get("rt_cd") != "0":
+                    logger.warning(
+                        "KIS stability-ratio API error: symbol=%s rt_cd=%s msg1=%s",
+                        symbol,
+                        data.get("rt_cd"),
+                        data.get("msg1"),
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                api_output = (data.get("output") or [])[:4]
                 n = len(api_output)
     
                 if n == 0:
-                    logger.error("No data returned for stability ratio for symbol: %s", symbol)
-                    return 0, []  # 기본값 반환
+                    logger.warning("KIS stability-ratio empty output: symbol=%s", symbol)
+                    return 0.0, [], update_access_token_flag, user_info
 
                 df = pd.DataFrame(api_output)
                 cols = ["lblt_rate", "bram_depn", "crnt_rate", "quck_rate"]
@@ -487,13 +543,32 @@ class PortfolioAnalysisTool(BaseTool):
                         status_code = res_refresh.status
                         text = await res_refresh.text()
 
-                data = json.loads(text)
-                api_output = data['output'][:4]
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning(
+                        "KIS profit-ratio JSON parse failed: symbol=%s status=%s text=%s",
+                        symbol,
+                        status_code,
+                        text[:200],
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                if data.get("rt_cd") != "0":
+                    logger.warning(
+                        "KIS profit-ratio API error: symbol=%s rt_cd=%s msg1=%s",
+                        symbol,
+                        data.get("rt_cd"),
+                        data.get("msg1"),
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                api_output = (data.get("output") or [])[:4]
                 n = len(api_output)
 
                 if n == 0:
-                    logger.error("No data returned for stability ratio for symbol: %s", symbol)
-                    return 0, []  # 기본값 반환
+                    logger.warning("KIS profit-ratio empty output: symbol=%s", symbol)
+                    return 0.0, [], update_access_token_flag, user_info
 
                 df = pd.DataFrame(api_output)
                 cols = ["cptl_ntin_rate","self_cptl_ntin_inrt","sale_ntin_rate","sale_totl_rate"]
@@ -545,14 +620,32 @@ class PortfolioAnalysisTool(BaseTool):
                         status_code = res_refresh.status
                         text = await res_refresh.text()
 
-                data = json.loads(text)
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning(
+                        "KIS growth-ratio JSON parse failed: symbol=%s status=%s text=%s",
+                        symbol,
+                        status_code,
+                        text[:200],
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
 
-                api_output = data['output'][:4]
+                if data.get("rt_cd") != "0":
+                    logger.warning(
+                        "KIS growth-ratio API error: symbol=%s rt_cd=%s msg1=%s",
+                        symbol,
+                        data.get("rt_cd"),
+                        data.get("msg1"),
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                api_output = (data.get("output") or [])[:4]
                 n = len(api_output)
 
                 if n == 0:
-                    logger.error("No data returned for stability ratio for symbol: %s", symbol)
-                    return 0, []  # 기본값 반환
+                    logger.warning("KIS growth-ratio empty output: symbol=%s", symbol)
+                    return 0.0, [], update_access_token_flag, user_info
 
                 df = pd.DataFrame(api_output)
                 cols = ["grs","bsop_prfi_inrt","equt_inrt","totl_aset_inrt"] # 매출액 증가율, 영업 이익 증가율, 자기자본 증가율, 총자산 증가율
@@ -605,14 +698,32 @@ class PortfolioAnalysisTool(BaseTool):
                         status_code = res_refresh.status
                         text = await res_refresh.text()
 
-                data = json.loads(text)
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning(
+                        "KIS major-ratio JSON parse failed: symbol=%s status=%s text=%s",
+                        symbol,
+                        status_code,
+                        text[:200],
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
 
-                api_output = data['output'][:4]
+                if data.get("rt_cd") != "0":
+                    logger.warning(
+                        "KIS major-ratio API error: symbol=%s rt_cd=%s msg1=%s",
+                        symbol,
+                        data.get("rt_cd"),
+                        data.get("msg1"),
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                api_output = (data.get("output") or [])[:4]
                 n = len(api_output)
 
                 if n == 0:
-                    logger.error("No data returned for stability ratio for symbol: %s", symbol)
-                    return 0, []  # 기본값 반환
+                    logger.warning("KIS major-ratio empty output: symbol=%s", symbol)
+                    return 0.0, [], update_access_token_flag, user_info
 
                 df = pd.DataFrame(api_output)
                 cols = ["payout_rate","eva","ebitda","ev_ebitda"] # 배당 성향, EVA, EBITDA, EV_EBITDA
@@ -664,13 +775,32 @@ class PortfolioAnalysisTool(BaseTool):
                         status_code = res_refresh.status
                         text = await res_refresh.text()
 
-                data = json.loads(text)
-                api_output = data['output'][:4]
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning(
+                        "KIS financial-ratio JSON parse failed: symbol=%s status=%s text=%s",
+                        symbol,
+                        status_code,
+                        text[:200],
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                if data.get("rt_cd") != "0":
+                    logger.warning(
+                        "KIS financial-ratio API error: symbol=%s rt_cd=%s msg1=%s",
+                        symbol,
+                        data.get("rt_cd"),
+                        data.get("msg1"),
+                    )
+                    return 0.0, [], update_access_token_flag, user_info
+
+                api_output = (data.get("output") or [])[:4]
                 n = len(api_output)
 
                 if n == 0:
-                    logger.error("No data returned for stability ratio for symbol: %s", symbol)
-                    return 0, []  # 기본값 반환
+                    logger.warning("KIS financial-ratio empty output: symbol=%s", symbol)
+                    return 0.0, [], update_access_token_flag, user_info
 
                 df = pd.DataFrame(api_output)
                 cols = ["grs","bsop_prfi_inrt","ntin_inrt","roe_val", "eps", "sps", "bps", "rsrv_rate", "lblt_rate"] # 매출액 증가율, 영업이익증가율, 순이익증가율, ROE, EPS, 주당매출액, BPS, 유보비율, 부채비율
