@@ -66,6 +66,7 @@ def get_async_engine() -> AsyncEngine:
     return _async_engine
 
 _async_engine_ksic: AsyncEngine | None = None
+_async_engine_ksic_disabled: bool = False
 
 
 def get_async_engine_ksic() -> AsyncEngine | None:
@@ -74,7 +75,12 @@ def get_async_engine_ksic() -> AsyncEngine | None:
     We intentionally do NOT hard-crash the whole API server when KSIC DB is not configured,
     because portfolio recommendations are not executed from the chatbot in this project.
     """
-    global _async_engine_ksic
+    global _async_engine_ksic, _async_engine_ksic_disabled
+
+    # 런타임에서 KSIC DB 연결 실패가 한 번이라도 발생하면, 프로세스 생명주기 동안 비활성화합니다.
+    # (대량 병렬 분석 시 매번 커넥션 실패로 전체 추천이 죽는 것을 방지)
+    if _async_engine_ksic_disabled:
+        return None
 
     if _async_engine_ksic is not None:
         return _async_engine_ksic
@@ -607,15 +613,29 @@ class PortfolioAnalysisTool(BaseTool):
             if engine_ksic is None:
                 result["induty_name"] = "N/A"
             else:
-                async with AsyncSession(engine_ksic) as session:
-                    stmt = select(Industy).where(Industy.industy_code == induty_code)
-                    db_result = await session.execute(stmt)
-                    industy = db_result.scalar_one_or_none()
+                try:
+                    async with AsyncSession(engine_ksic) as session:
+                        stmt = select(Industy).where(Industy.industy_code == induty_code)
+                        db_result = await session.execute(stmt)
+                        industy = db_result.scalar_one_or_none()
 
-                    if industy:
-                        result["induty_name"] = industy.industy_name
-                    else:
-                        result["induty_name"] = "N/A"
+                        if industy:
+                            result["induty_name"] = industy.industy_name
+                        else:
+                            result["induty_name"] = "N/A"
+                except Exception as e:
+                    # KSIC DB가 없거나(예: database "ksic" does not exist), 네트워크/권한 문제가 있더라도
+                    # 추천 전체가 죽지 않도록 폴백합니다.
+                    logger.warning(
+                        "KSIC industry lookup failed (induty_code=%s). Disable KSIC lookups for this process. err=%s",
+                        induty_code,
+                        e,
+                    )
+                    # 이후 호출에서 반복 실패를 피하기 위해 비활성화
+                    global _async_engine_ksic, _async_engine_ksic_disabled
+                    _async_engine_ksic_disabled = True
+                    _async_engine_ksic = None
+                    result["induty_name"] = "N/A"
         else:
             result["induty_name"] = "N/A"
         

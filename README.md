@@ -96,7 +96,7 @@ ASYNC_DATABASE_URL=
 # (선택) 기본 schema는 public 입니다. 다르면 지정
 STOCKELPER_WEB_SCHEMA=public
 
-ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택
+ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택(없으면 비워두세요)
 
 # 외부 API
 # - DART 키는 1개 또는 여러 개를 설정할 수 있습니다.
