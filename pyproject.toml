@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.111.0",
     "requests",
-    "httpx",
     "aiohttp",
     "numpy",
     "openai",
@@ -20,14 +19,10 @@ dependencies = [
     "psycopg[binary]==3.2.*",
     "sqlalchemy>=2.0",
     "langchain>=1.0.0",
-    "langchain-classic>=1.0.0",
     "langgraph",
     "langfuse",
     "langgraph-checkpoint-postgres",
     "langchain-openai",
-    "langchain-community",
-    "langchain-neo4j",
-    "neo4j",
     "pymongo",
     "motor",
     "youtube-transcript-api",
@@ -42,11 +37,8 @@ dependencies = [
 [project.optional-dependencies]
 ml = [
     "langchain>=1.0.0",
-    "langchain-classic>=1.0.0",
     "langgraph",
-    "langchain-community", 
     "langchain-openai",
-    "langchain-huggingface",
     "langfuse",
     "pymongo",
     "lancedb",
@@ -56,7 +48,6 @@ ml = [
     "youtube-transcript-api",
     "google-api-python-client",
     "langgraph-checkpoint-postgres",
-    "langchain-neo4j",
 ]
 dev = [
     "pytest",

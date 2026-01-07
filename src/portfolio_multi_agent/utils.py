@@ -1,11 +1,11 @@
+from __future__ import annotations
+
 import json
 import re
 from typing import Any
-import httpx
+
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import RunnableConfig
 
 
 class JsonOutputParser(StrOutputParser):
@@ -34,77 +34,36 @@ class JsonOutputParser(StrOutputParser):
         return structured_output
 
 
-class PerplexityChat(BaseChatModel):
-    model: str = "perplexity/sonar"
-    base_url: str = ""
-    api_key: str = ""
-    max_timeout: int = 60
+def with_runnable_config(
+    config: RunnableConfig | None,
+    *,
+    run_name: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    tags: list[str] | None = None,
+) -> RunnableConfig | None:
+    """기존 RunnableConfig에 run_name/metadata/tags를 안전하게 합쳐 반환합니다.
 
-    def _llm_type(self) -> str:
-        return "perplexity-chat"
+    - 원본 config를 변형하지 않습니다.
+    - config가 없고 추가할 값도 없으면 None을 그대로 반환합니다.
+    """
+    if config is None and run_name is None and not metadata and not tags:
+        return None
 
-    def _generate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        **kwargs: Any,
-    ) -> AIMessage:
-        user_text = messages[-1].content if messages else ""
-        with httpx.Client(base_url=self.base_url, timeout=self.max_timeout) as client:
-            resp = client.post(
-                "/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": user_text}],
-                },
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            citations = data.get("citations", [])
-            message = AIMessage(content=content, response_metadata={"citations": citations})
-            generation = ChatGeneration(message=message)
-            return ChatResult(generations=[generation])
+    merged: dict[str, Any] = dict(config or {})
 
-    async def _agenerate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        **kwargs: Any,
-    ) -> AIMessage:
-        user_text = messages[-1].content if messages else ""
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=self.max_timeout) as client:
-            resp = await client.post(
-                "/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": user_text}],
-                },
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            citations = data.get("citations", [])
-            message = AIMessage(
-                content=content,
-                additional_kwargs={},
-                response_metadata={
-                    "citations": citations,
-                    "model_name": self.model,
-                },
-                usage_metadata={
-                    "input_tokens": data["usage"]["prompt_tokens"],
-                    "output_tokens": data["usage"]["completion_tokens"],
-                    "total_tokens": data["usage"]["total_tokens"],
-                },
-            )
-            generation = ChatGeneration(message=message)
-            return ChatResult(generations=[generation])
+    if run_name:
+        merged["run_name"] = run_name
+
+    if metadata:
+        md = dict(merged.get("metadata") or {})
+        md.update(metadata)
+        merged["metadata"] = md
+
+    if tags:
+        existing = list(merged.get("tags") or [])
+        for t in tags:
+            if t not in existing:
+                existing.append(t)
+        merged["tags"] = existing
+
+    return merged

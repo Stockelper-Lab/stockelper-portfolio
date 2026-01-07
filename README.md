@@ -102,6 +102,13 @@ ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택
 OPEN_DART_API_KEY=
 OPENROUTER_API_KEY=
 
+# (옵션) Langfuse 트레이싱
+# - 설정 시 /portfolio/* 요청의 LangChain/LangGraph 실행이 Langfuse로 트레이싱됩니다.
+# - 가이드: [Langfuse Get Started](https://langfuse.com/docs/observability/get-started)
+LANGFUSE_SECRET_KEY=
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+
 # (선택) KIS 호출 Rate Limit (초당 최대 요청 수)
 KIS_MAX_REQUESTS_PER_SECOND=20
 

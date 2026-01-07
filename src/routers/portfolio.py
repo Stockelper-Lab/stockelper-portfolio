@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
@@ -8,6 +9,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from observability.langfuse import build_langfuse_runnable_config
 from multi_agent.portfolio_analysis_agent.tools.portfolio import PortfolioAnalysisTool
 from multi_agent.utils import (
     create_portfolio_recommendation_job,
@@ -99,9 +101,29 @@ async def recommend_portfolio(body: PortfolioRecommendationRequest):
 
         # 3) 포트폴리오 추천 생성
         tool = PortfolioAnalysisTool()
+        lf_cfg = build_langfuse_runnable_config(
+            run_name="portfolio_recommendations",
+            trace_id=job_id,
+            user_id=body.user_id,
+            session_id=str(body.user_id),
+            tags=[
+                "stockelper-portfolio",
+                "api",
+                "portfolio",
+                "recommendations",
+            ],
+            metadata={
+                "endpoint": "/portfolio/recommendations",
+                "rec_id": rec_id,
+                "job_id": job_id,
+                "investor_type": investor_type,
+            },
+        )
+        cfg = {"configurable": {"user_id": body.user_id}}
+        cfg.update(lf_cfg)
         result = await tool.ainvoke(
             {"user_investor_type": investor_type, "portfolio_size": body.portfolio_size},
-            config={"configurable": {"user_id": body.user_id}},
+            config=cfg,
         )
 
         # 4) 결과 생성 완료 후, 최초 레코드를 업데이트
@@ -127,7 +149,19 @@ async def buy_portfolio(body: BuyInputState):
     """포트폴리오 매수 워크플로우 실행(LangGraph)."""
     workflow = _get_buy_workflow()
     try:
-        result = await workflow.ainvoke(body.model_dump())
+        trace_id = str(uuid.uuid4())
+        lf_cfg = build_langfuse_runnable_config(
+            run_name="portfolio_buy_agent",
+            trace_id=trace_id,
+            user_id=body.user_id,
+            session_id=str(body.user_id),
+            tags=["stockelper-portfolio", "api", "portfolio", "buy"],
+            metadata={
+                "endpoint": "/portfolio/buy",
+                "trace_id": trace_id,
+            },
+        )
+        result = await workflow.ainvoke(body.model_dump(), config=lf_cfg)
     except Exception as e:
         # 워크플로우 내부(외부 API/토큰/입력값) 오류를 500이 아닌 502로 노출
         raise HTTPException(
@@ -142,7 +176,19 @@ async def sell_portfolio(body: SellInputState):
     """포트폴리오 매도 워크플로우 실행(LangGraph)."""
     workflow = _get_sell_workflow()
     try:
-        result = await workflow.ainvoke(body.model_dump())
+        trace_id = str(uuid.uuid4())
+        lf_cfg = build_langfuse_runnable_config(
+            run_name="portfolio_sell_agent",
+            trace_id=trace_id,
+            user_id=body.user_id,
+            session_id=str(body.user_id),
+            tags=["stockelper-portfolio", "api", "portfolio", "sell"],
+            metadata={
+                "endpoint": "/portfolio/sell",
+                "trace_id": trace_id,
+            },
+        )
+        result = await workflow.ainvoke(body.model_dump(), config=lf_cfg)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

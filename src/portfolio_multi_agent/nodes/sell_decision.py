@@ -1,10 +1,12 @@
-import os
 import json
+import os
 from typing import Literal
+
 from pydantic import BaseModel, Field
+from langchain_core.runnables import RunnableConfig
 from portfolio_multi_agent.state import HoldingStock, AnalysisResult, SellDecision
-from portfolio_multi_agent.utils import JsonOutputParser
 from langchain_openai import ChatOpenAI
+from portfolio_multi_agent.utils import JsonOutputParser, with_runnable_config
 
 
 class SellDecisionResponseSchema(BaseModel):
@@ -97,7 +99,9 @@ Here is the output schema:
         )
         self.chain = llm | JsonOutputParser(response_schema=SellDecisionResponseSchema)
 
-    async def __call__(self, state: InputState) -> OutputState:
+    async def __call__(
+        self, state: InputState, config: RunnableConfig | None = None
+    ) -> OutputState:
         """
         보유 종목 분석 결과를 기반으로 매도할 종목을 결정
 
@@ -127,6 +131,7 @@ Here is the output schema:
                 analyses=analyses,
                 loss_threshold=state.loss_threshold,
                 profit_threshold=state.profit_threshold,
+                config=config,
             )
 
             if decision:
@@ -172,6 +177,7 @@ Here is the output schema:
         analyses: dict[str, str],
         loss_threshold: float,
         profit_threshold: float,
+        config: RunnableConfig | None = None,
     ) -> SellDecision | None:
         """
         단일 종목에 대한 매도 결정
@@ -218,7 +224,16 @@ Here is the output schema:
         ]
 
         # LLM 체인 실행
-        response = await self.chain.ainvoke(messages)
+        cfg = with_runnable_config(
+            config,
+            run_name=f"SellDecision:{holding.code}",
+            metadata={
+                "stock_code": holding.code,
+                "stock_name": holding.name,
+                "analysis_type": "sell_decision",
+            },
+        )
+        response = await self.chain.ainvoke(messages, config=cfg)
 
         decision = str(response.get("decision", "HOLD"))
         reasoning = str(response.get("reasoning", ""))

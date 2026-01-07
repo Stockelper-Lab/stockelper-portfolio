@@ -73,7 +73,7 @@ def test_portfolio_recommendations_mocked(monkeypatch):
 
 def test_portfolio_buy_mocked(monkeypatch):
     class DummyWorkflow:
-        async def ainvoke(self, payload):  # noqa: ANN001
+        async def ainvoke(self, payload, config=None):  # noqa: ANN001
             return {"ok": True, "input": payload}
 
     monkeypatch.setattr(portfolio_router, "_get_buy_workflow", lambda: DummyWorkflow())
@@ -88,7 +88,7 @@ def test_portfolio_buy_mocked(monkeypatch):
 
 def test_portfolio_sell_mocked(monkeypatch):
     class DummyWorkflow:
-        async def ainvoke(self, payload):  # noqa: ANN001
+        async def ainvoke(self, payload, config=None):  # noqa: ANN001
             return {"ok": True, "input": payload}
 
     monkeypatch.setattr(portfolio_router, "_get_sell_workflow", lambda: DummyWorkflow())

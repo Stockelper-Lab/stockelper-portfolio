@@ -1,9 +1,11 @@
-import os
 import json
+import os
+
 from pydantic import BaseModel, Field
+from langchain_core.runnables import RunnableConfig
 from portfolio_multi_agent.state import Stock, AnalysisResult, InvestorView
-from portfolio_multi_agent.utils import JsonOutputParser
 from langchain_openai import ChatOpenAI
+from portfolio_multi_agent.utils import JsonOutputParser, with_runnable_config
 
 
 class ViewResponseSchema(BaseModel):
@@ -99,7 +101,9 @@ Here is the output schema:
         )
         self.chain = llm | JsonOutputParser(response_schema=ViewResponseSchema)
 
-    async def __call__(self, state: InputState) -> OutputState:
+    async def __call__(
+        self, state: InputState, config: RunnableConfig | None = None
+    ) -> OutputState:
         """
         모든 종목에 대한 투자자 뷰 생성
 
@@ -128,6 +132,7 @@ Here is the output schema:
                 stock_name=stock.name,
                 stock_code=stock.code,
                 analyses=analyses,
+                config=config,
             )
 
             if view:
@@ -171,6 +176,7 @@ Here is the output schema:
         stock_name: str,
         stock_code: str,
         analyses: dict[str, str],
+        config: RunnableConfig | None = None,
     ) -> InvestorView | None:
         """
         단일 종목에 대한 투자자 뷰 생성
@@ -221,7 +227,16 @@ Here is the output schema:
         ]
 
         # LLM 체인 실행
-        response = await self.chain.ainvoke(messages)
+        cfg = with_runnable_config(
+            config,
+            run_name=f"ViewGenerator:{stock_code}",
+            metadata={
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+                "analysis_type": "generate_views",
+            },
+        )
+        response = await self.chain.ainvoke(messages, config=cfg)
 
         expected_return = float(response.get("expected_return", 0.0))
         confidence = float(response.get("confidence", 0.5))

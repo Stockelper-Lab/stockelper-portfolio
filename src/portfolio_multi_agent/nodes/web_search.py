@@ -1,10 +1,12 @@
-import os
 import asyncio
+import os
+
 from pydantic import BaseModel, Field
-from portfolio_multi_agent.state import Stock, AnalysisResult
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 
-from .rank_func import *
+from portfolio_multi_agent.state import AnalysisResult, Stock
+from portfolio_multi_agent.utils import with_runnable_config
 
 
 class InputState(BaseModel):
@@ -25,7 +27,9 @@ class WebSearch:
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
 
-    async def search_single_stock(self, stock: Stock) -> AnalysisResult:
+    async def search_single_stock(
+        self, stock: Stock, config: RunnableConfig | None = None
+    ) -> AnalysisResult:
         """
         단일 종목에 대한 웹 검색 분석
 
@@ -36,7 +40,16 @@ class WebSearch:
             AnalysisResult 객체
         """
         query = f"{stock.name}({stock.code}) 주식의 최근 뉴스, 재무 실적, 투자 전망, 주요 리스크 요인, 그리고 산업 동향을 종합적으로 분석하여 투자 의사결정에 도움이 될 수 있는 정보를 제공해주세요."
-        response = await self.llm.ainvoke(query)
+        cfg = with_runnable_config(
+            config,
+            run_name=f"WebSearch:{stock.code}",
+            metadata={
+                "stock_code": stock.code,
+                "stock_name": stock.name,
+                "analysis_type": "web_search",
+            },
+        )
+        response = await self.llm.ainvoke(query, config=cfg)
 
         return AnalysisResult(
             code=stock.code,
@@ -45,7 +58,9 @@ class WebSearch:
             result=response.content,
         )
 
-    async def __call__(self, state: InputState) -> OutputState:
+    async def __call__(
+        self, state: InputState, config: RunnableConfig | None = None
+    ) -> OutputState:
         """
         여러 종목에 대한 웹 검색 분석을 병렬로 실행
 
@@ -59,7 +74,10 @@ class WebSearch:
             return {"analysis_results": []}
 
         # 모든 종목에 대해 병렬로 웹 검색 분석
-        tasks = [self.search_single_stock(stock) for stock in state.portfolio_list]
+        tasks = [
+            self.search_single_stock(stock, config=config)
+            for stock in state.portfolio_list
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 성공한 결과만 필터링
