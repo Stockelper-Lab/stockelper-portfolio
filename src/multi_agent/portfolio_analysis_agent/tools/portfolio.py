@@ -23,6 +23,12 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+from multi_agent.dart import (
+    is_dart_quota_exceeded_error,
+    mask_api_key,
+    parse_open_dart_api_keys,
+)
+
 _async_engine: AsyncEngine | None = None
 
 
@@ -395,31 +401,79 @@ class PortfolioAnalysisTool(BaseTool):
             self._dart_client = None
         if not hasattr(self, "_dart_api_key"):
             self._dart_api_key = None
+        if not hasattr(self, "_dart_api_keys"):
+            self._dart_api_keys = []
+        if not hasattr(self, "_dart_key_index"):
+            self._dart_key_index = 0
+        if not hasattr(self, "_dart_exhausted_keys"):
+            self._dart_exhausted_keys = set()
 
     async def _get_dart_client(self):
         """가능하면 OpenDartReader 인스턴스를 재사용하여 반환합니다."""
-        api_key = os.getenv("OPEN_DART_API_KEY")
-        if not api_key:
+        api_keys = parse_open_dart_api_keys()
+        if not api_keys:
             return None
 
         self._ensure_dart_client()
 
-        # 이미 같은 키로 초기화돼 있으면 그대로 사용
-        if getattr(self, "_dart_client", None) is not None and getattr(self, "_dart_api_key", None) == api_key:
-            return self._dart_client
+        # env 변경(키 추가/삭제)을 반영
+        if getattr(self, "_dart_api_keys", None) != api_keys:
+            self._dart_api_keys = api_keys
+            self._dart_key_index = 0
+            self._dart_exhausted_keys = set()
+            self._dart_client = None
+            self._dart_api_key = None
 
         async with self._dart_lock:
             # double-check
-            if getattr(self, "_dart_client", None) is not None and getattr(self, "_dart_api_key", None) == api_key:
+            if getattr(self, "_dart_client", None) is not None and getattr(self, "_dart_api_key", None) in api_keys:
                 return self._dart_client
-            try:
-                self._dart_client = OpenDartReader(api_key)
-                self._dart_api_key = api_key
-            except Exception as e:
-                # 키 오류/한도 초과 등: 추천 전체가 죽지 않도록 None 처리
-                logger.warning("Failed to initialize OpenDartReader: %s", e)
-                self._dart_client = None
-                self._dart_api_key = api_key
+
+            keys: list[str] = list(self._dart_api_keys or [])
+            if not keys:
+                return None
+
+            # 현재 인덱스부터 순환하며 초기화 시도 (status=020이면 다음 키로 폴백)
+            tried = 0
+            start_idx = int(self._dart_key_index or 0) % len(keys)
+            idx = start_idx
+
+            while tried < len(keys):
+                api_key = keys[idx]
+                idx = (idx + 1) % len(keys)
+                tried += 1
+
+                if api_key in self._dart_exhausted_keys:
+                    continue
+
+                try:
+                    self._dart_client = OpenDartReader(api_key)
+                    self._dart_api_key = api_key
+                    self._dart_key_index = idx
+                    return self._dart_client
+                except Exception as e:
+                    if is_dart_quota_exceeded_error(e):
+                        # 한도 초과 키는 건너뛰고 다음 키로 계속
+                        self._dart_exhausted_keys.add(api_key)
+                        logger.warning(
+                            "OpenDartReader quota exceeded(status=020). rotate key: %s",
+                            mask_api_key(api_key),
+                        )
+                        continue
+
+                    # 기타 오류(키 오류 등): 해당 키는 제외하고 다음 키 시도
+                    self._dart_exhausted_keys.add(api_key)
+                    logger.warning(
+                        "Failed to initialize OpenDartReader (key=%s): %s",
+                        mask_api_key(api_key),
+                        e,
+                    )
+                    continue
+
+            # 모든 키 실패
+            self._dart_client = None
+            self._dart_api_key = None
+            return None
         return self._dart_client
 
 
@@ -489,18 +543,58 @@ class PortfolioAnalysisTool(BaseTool):
             }
 
         # DART 사용량 초과/키 오류 등으로 실패할 수 있으므로, 추천이 전체적으로 죽지 않게 처리
+        result = None
         try:
             # OpenDartReader는 동기 호출이므로 thread로 실행
             result = await asyncio.to_thread(dart.company, symbol)
         except Exception as e:
-            logger.warning("DART company lookup failed for %s: %s", symbol, e)
-            return {
-                "corp_name": symbol,
-                "corp_cls": None,
-                "market": "N/A",
-                "induty_code": None,
-                "induty_name": "N/A",
-            }
+            # 한도초과(status=020)면 다른 키로 1회 재시도
+            if is_dart_quota_exceeded_error(e):
+                logger.warning(
+                    "DART company quota exceeded(status=020) for %s; retry with rotated key",
+                    symbol,
+                )
+                async with self._dart_lock:
+                    # 현재 클라이언트를 무효화 → 다음 _get_dart_client()에서 다음 키를 선택
+                    if self._dart_api_key:
+                        self._dart_exhausted_keys.add(self._dart_api_key)
+                    self._dart_client = None
+                    self._dart_api_key = None
+
+                dart2 = await self._get_dart_client()
+                if dart2 is not None:
+                    try:
+                        result = await asyncio.to_thread(dart2.company, symbol)
+                    except Exception as e2:
+                        logger.warning(
+                            "DART company lookup failed for %s after retry: %s",
+                            symbol,
+                            e2,
+                        )
+                        return {
+                            "corp_name": symbol,
+                            "corp_cls": None,
+                            "market": "N/A",
+                            "induty_code": None,
+                            "induty_name": "N/A",
+                        }
+                else:
+                    return {
+                        "corp_name": symbol,
+                        "corp_cls": None,
+                        "market": "N/A",
+                        "induty_code": None,
+                        "induty_name": "N/A",
+                    }
+            else:
+                logger.warning("DART company lookup failed for %s: %s", symbol, e)
+                return {
+                    "corp_name": symbol,
+                    "corp_cls": None,
+                    "market": "N/A",
+                    "induty_code": None,
+                    "induty_name": "N/A",
+                }
 
         result["market"] = MARKET_MAP.get(result.get("corp_cls"), result.get("corp_cls"))
         

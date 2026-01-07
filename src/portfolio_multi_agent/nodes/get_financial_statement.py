@@ -1,10 +1,17 @@
 import os
 import asyncio
 import logging
+import threading
 from pydantic import BaseModel, Field
 from portfolio_multi_agent.state import Stock, AnalysisResult
 import OpenDartReader
 from datetime import datetime
+
+from multi_agent.dart import (
+    is_dart_quota_exceeded_error,
+    mask_api_key,
+    parse_open_dart_api_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,24 +30,84 @@ class FinancialStatement:
     def __init__(self):
         # 워크플로우 컴파일 단계에서 외부 API(네트워크) 호출로 서버가 죽지 않도록
         # DART 클라이언트는 실제 분석 호출 시점에 지연 초기화합니다.
-        self.api_key = os.getenv("OPEN_DART_API_KEY")
+        self.api_keys = parse_open_dart_api_keys()
         self.dart = None
-        if not self.api_key:
+        self._dart_api_key = None
+        self._dart_key_index = 0
+        self._dart_exhausted_keys: set[str] = set()
+        self._dart_lock = threading.Lock()
+
+        if not self.api_keys:
             logger.warning(
-                "OPEN_DART_API_KEY is not set; FinancialStatement analysis will be disabled."
+                "OPEN_DART_API_KEY(S) is not set; FinancialStatement analysis will be disabled."
             )
+
+    def _invalidate_current_key(self):
+        """현재 키를 '소진'으로 마킹하고 클라이언트를 무효화합니다."""
+        with self._dart_lock:
+            if self._dart_api_key:
+                self._dart_exhausted_keys.add(self._dart_api_key)
+            self.dart = None
+            self._dart_api_key = None
 
     def _get_dart(self):
         """DART 클라이언트를 지연 초기화하여 반환합니다."""
-        if self.dart is not None:
+        keys = parse_open_dart_api_keys()
+        if keys != self.api_keys:
+            # env 변경 반영
+            self.api_keys = keys
+            self._dart_key_index = 0
+            self._dart_exhausted_keys = set()
+            self.dart = None
+            self._dart_api_key = None
+
+        if self.dart is not None and self._dart_api_key in (self.api_keys or []):
             return self.dart
-        if not self.api_key:
-            raise ValueError("OPEN_DART_API_KEY 환경변수가 설정되어 있지 않습니다.")
-        try:
-            self.dart = OpenDartReader(self.api_key)
-        except Exception as e:
-            raise ValueError(f"OpenDartReader 초기화 실패: {e}") from e
-        return self.dart
+
+        if not self.api_keys:
+            raise ValueError("OPEN_DART_API_KEY 또는 OPEN_DART_API_KEYS 환경변수가 설정되어 있지 않습니다.")
+
+        with self._dart_lock:
+            # double-check
+            if self.dart is not None and self._dart_api_key in (self.api_keys or []):
+                return self.dart
+
+            keys = list(self.api_keys or [])
+            start_idx = int(self._dart_key_index or 0) % len(keys)
+            idx = start_idx
+            tried = 0
+
+            while tried < len(keys):
+                api_key = keys[idx]
+                idx = (idx + 1) % len(keys)
+                tried += 1
+
+                if api_key in self._dart_exhausted_keys:
+                    continue
+
+                try:
+                    self.dart = OpenDartReader(api_key)
+                    self._dart_api_key = api_key
+                    self._dart_key_index = idx
+                    return self.dart
+                except Exception as e:
+                    if is_dart_quota_exceeded_error(e):
+                        self._dart_exhausted_keys.add(api_key)
+                        logger.warning(
+                            "OpenDartReader quota exceeded(status=020). rotate key: %s",
+                            mask_api_key(api_key),
+                        )
+                        continue
+
+                    self._dart_exhausted_keys.add(api_key)
+                    logger.warning(
+                        "Failed to initialize OpenDartReader (key=%s): %s",
+                        mask_api_key(api_key),
+                        e,
+                    )
+                    continue
+
+            raise ValueError("OpenDartReader 초기화 실패: 사용 가능한 DART API Key가 없습니다.")
 
     async def __call__(self, state: InputState) -> OutputState:
         """
@@ -241,6 +308,21 @@ class FinancialStatement:
                     break
 
             except Exception as e:
+                if is_dart_quota_exceeded_error(e):
+                    logger.warning(
+                        "DART finstate_all quota exceeded(status=020) for %s(%s); rotate key and retry once",
+                        stock.name,
+                        stock.code,
+                    )
+                    self._invalidate_current_key()
+                    try:
+                        dart = self._get_dart()
+                        df = dart.finstate_all(stock.code, year)
+                        if df is not None and not df.empty:
+                            financial_statement_all = df
+                            break
+                    except Exception:
+                        pass
                 continue
 
         if financial_statement_all is None or financial_statement_all.empty:
