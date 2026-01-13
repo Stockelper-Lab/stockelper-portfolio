@@ -30,5 +30,5 @@ COPY . .
 ENV PORT=21010
 EXPOSE 21010
 
-# 애플리케이션 실행
-CMD ["uv", "run", "python", "src/main.py"]
+# 애플리케이션 실행 (이미 uv sync로 .venv가 생성되었으므로 직접 실행)
+CMD [".venv/bin/python", "src/main.py"]

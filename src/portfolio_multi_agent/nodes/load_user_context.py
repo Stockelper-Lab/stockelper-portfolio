@@ -38,7 +38,8 @@ def _get_engine():
     )
     if not async_db_url:
         raise RuntimeError("ASYNC_DATABASE_URL 또는 DATABASE_URL 이 설정되어 있지 않습니다.")
-    _ENGINE = create_async_engine(async_db_url, echo=False)
+    # NOTE: DB가 idle 커넥션을 끊는 경우, 풀에서 꺼낸 커넥션이 closed일 수 있어 pre-ping을 켭니다.
+    _ENGINE = create_async_engine(async_db_url, echo=False, pool_pre_ping=True)
     return _ENGINE
 
 

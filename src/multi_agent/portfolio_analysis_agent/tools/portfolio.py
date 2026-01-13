@@ -62,7 +62,9 @@ def get_async_engine() -> AsyncEngine:
     if not async_db_url:
         raise RuntimeError("Missing required environment variable: ASYNC_DATABASE_URL")
 
-    _async_engine = create_async_engine(async_db_url, echo=False)
+    # NOTE: DB가 idle 커넥션을 끊는 환경에서 stale connection 재사용으로
+    # asyncpg "connection is closed"가 발생할 수 있어 pre-ping을 켭니다.
+    _async_engine = create_async_engine(async_db_url, echo=False, pool_pre_ping=True)
     return _async_engine
 
 _async_engine_ksic: AsyncEngine | None = None
@@ -90,7 +92,9 @@ def get_async_engine_ksic() -> AsyncEngine | None:
         logger.warning("ASYNC_DATABASE_URL_KSIC is not set; KSIC industry lookups will be disabled.")
         return None
 
-    _async_engine_ksic = create_async_engine(async_database_url_ksic, echo=False)
+    _async_engine_ksic = create_async_engine(
+        async_database_url_ksic, echo=False, pool_pre_ping=True
+    )
     return _async_engine_ksic
 
 
