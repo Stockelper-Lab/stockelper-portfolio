@@ -396,6 +396,113 @@ async def get_access_token(app_key, app_secret):
                 text = await res.text()
                 print(f"토큰 발급 실패: {res.status} - {text}")
                 return None
+
+
+def _get_kis_api_base_url() -> str:
+    """KIS API Base URL (모의투자 기본)."""
+    return (
+        os.getenv("KIS_API_BASE_URL")
+        or os.getenv("KIS_OAUTH_BASE_URL")
+        or "https://openapivts.koreainvestment.com:29443"
+    ).rstrip("/")
+
+
+def _is_kis_token_invalid_text(text: str) -> bool:
+    t = (text or "").strip()
+    return ("기간이 만료된 token" in t) or ("유효하지 않은 token" in t)
+
+
+async def validate_kis_access_token(
+    app_key: str,
+    app_secret: str,
+    access_token: str,
+    *,
+    base_url: str | None = None,
+    symbol: str = "005930",
+) -> tuple[bool, str]:
+    """저장된 access_token이 유효한지 KIS 시세 API로 확인합니다.
+
+    - token 자체는 만료 시점 정보를 포함하지 않으므로, KIS 보호 엔드포인트(시세) 호출로 유효성 판단합니다.
+    - 계좌번호가 필요 없는 endpoint를 사용해, 계좌 불일치/잔고조회 실패와 분리합니다.
+    """
+    base = (base_url or _get_kis_api_base_url()).rstrip("/")
+    url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {access_token}",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": "FHKST01010100",
+        "custtype": "P",
+    }
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": symbol,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, params=params) as res:
+                text = await res.text()
+                if res.status != 200:
+                    # 보통 만료/무효 토큰은 401/403/500 + 문구로 내려옵니다.
+                    if res.status in (401, 403):
+                        return False, text[:200]
+                    if _is_kis_token_invalid_text(text):
+                        return False, text[:200]
+                    return True, ""
+
+                # HTTP 200이라도 rt_cd로 실패가 내려올 수 있음
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    return True, ""
+
+                if str(data.get("rt_cd", "")).strip() == "0":
+                    return True, ""
+
+                msg1 = str(data.get("msg1", "") or "")
+                if _is_kis_token_invalid_text(msg1) or _is_kis_token_invalid_text(text):
+                    return False, msg1[:200] or text[:200]
+
+                return True, ""
+    except Exception:
+        # 검증 호출 자체 실패(네트워크 등)는 토큰 만료로 단정하지 않습니다.
+        return True, ""
+
+
+async def ensure_user_kis_access_token(
+    async_engine: object,
+    user_id: int,
+    user_info: dict,
+    *,
+    validate: bool = True,
+) -> str:
+    """DB 저장 토큰 재사용 + 만료/무효 시 재발급 후 DB 업데이트."""
+    token = str((user_info or {}).get("kis_access_token", "") or "").strip()
+    if not token:
+        token = await get_access_token(user_info["kis_app_key"], user_info["kis_app_secret"])
+        if not token:
+            raise ValueError("KIS access token 발급 실패 (app_key/app_secret 확인 필요)")
+        await update_user_kis_credentials(async_engine, user_id, token)
+        return token
+
+    if validate:
+        ok, _reason = await validate_kis_access_token(
+            user_info["kis_app_key"],
+            user_info["kis_app_secret"],
+            token,
+            base_url=_get_kis_api_base_url(),
+        )
+        if not ok:
+            token = await get_access_token(user_info["kis_app_key"], user_info["kis_app_secret"])
+            if not token:
+                raise ValueError("만료된 KIS 토큰 재발급 실패 (rate limit/키/네트워크 확인 필요)")
+            await update_user_kis_credentials(async_engine, user_id, token)
+            return token
+
+    return token
     
 
 async def check_account_balance(app_key, app_secret, access_token, account_no):

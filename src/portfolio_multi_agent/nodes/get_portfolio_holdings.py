@@ -79,8 +79,8 @@ class GetPortfolioHoldings:
                 raise
 
             # NOTE:
-            # 본 프로젝트는 LoadUserContext에서 매 요청마다 access_token을 발급/DB에 저장한 뒤 사용합니다.
-            # 따라서 여기서는 token 자동 갱신을 별도로 수행하지 않습니다.
+            # token 발급/갱신/DB 업데이트는 LoadUserContext에서 수행합니다.
+            # (DB 저장 토큰 재사용 + 만료/무효 시 시세 API로 검증 후 재발급)
 
             # 응답 코드 확인
             if res_data.get("rt_cd") != "0":

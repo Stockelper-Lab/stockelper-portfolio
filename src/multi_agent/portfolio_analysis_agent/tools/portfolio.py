@@ -9,7 +9,12 @@ from pydantic import BaseModel, Field
 import time
 import pandas as pd
 import numpy as np
-from ...utils import get_user_kis_credentials, get_access_token, Industy
+from ...utils import (
+    get_user_kis_credentials,
+    get_access_token,
+    ensure_user_kis_access_token,
+    Industy,
+)
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
@@ -120,10 +125,12 @@ class PortfolioAnalysisInput(BaseModel):
 class PortfolioAnalysisTool(BaseTool):
     name: str = "portfolio_analysis"
     description: str = "Analyzes and recommends portfolio based on user's investor type. Evaluates stocks using market value, stability, profitability, and growth metrics, then suggests optimal portfolio composition tailored to the user's investment style."
-    # KIS 모의/실전 base URL
-    # - 기본값은 모의투자(openapivts)
-    # - 실전 환경은 KIS_API_BASE_URL=https://openapi.koreainvestment.com:9443 로 설정
-    url_base: str = os.getenv("KIS_API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
+    # NOTE:
+    # 본 서비스(포트폴리오 추천/매매)는 "모의투자(VTS)" 계좌를 기준으로 동작합니다.
+    # 따라서 KIS base URL은 openapivts로 고정합니다.
+    #
+    # (실전 전환이 필요하면, TR ID/주문 TR/도메인/키 분리 등 더 큰 변경이 필요합니다.)
+    url_base: str = "https://openapivts.koreainvestment.com:29443"
     args_schema: Type[BaseModel] = PortfolioAnalysisInput
 
     return_direct: bool = True
@@ -208,8 +215,11 @@ class PortfolioAnalysisTool(BaseTool):
                 if status_code in (401, 403, 500) and (
                     "기간이 만료된 token" in text or "유효하지 않은 token" in text
                 ):
-                    user_info["kis_access_token"] = await get_access_token(
-                        user_info["kis_app_key"], user_info["kis_app_secret"]
+                    # NOTE: url_base(모의/실전)와 동일한 OAuth 엔드포인트에서 토큰을 발급해야 합니다.
+                    # (open-trading-api 샘플도 prod/vps에 따라 별도 발급)
+                    base_url = (self.url_base or "").rstrip("/")
+                    user_info["kis_access_token"] = await self._issue_access_token_for_base(
+                        base_url, user_info["kis_app_key"], user_info["kis_app_secret"]
                     )
                     update_access_token_flag = True
                     headers["authorization"] = f"Bearer {user_info['kis_access_token']}"
@@ -253,110 +263,288 @@ class PortfolioAnalysisTool(BaseTool):
         - 모의투자(openapivts): VTTC8434R
         - 실전(openapi): TTTC8434R
         """
-        base = (self.url_base or "").lower()
-        if "openapivts" in base:
-            return "VTTC8434R"
-        return "TTTC8434R"
+        # 모의투자 고정
+        return "VTTC8434R"
 
-    async def _fetch_user_holdings(self, base_url: str, tr_id: str, user_info: dict) -> dict:
-        """(내부) 특정 base_url/TR로 기보유 종목을 조회합니다."""
-        account_no = user_info.get("account_no") or ""
-        if "-" not in account_no:
-            raise ValueError("account_no 형식이 올바르지 않습니다. (예: 12345678-01)")
+    async def _issue_access_token_for_base(
+        self, base_url: str, app_key: str, app_secret: str
+    ) -> str:
+        """특정 base_url(openapivts/openapi)에 대해 OAuth 토큰을 발급합니다.
 
-        url = base_url.rstrip("/") + "/uapi/domestic-stock/v1/trading/inquire-balance"
-        headers = {
-            "Content-Type": "application/json",
-            "authorization": f"Bearer {user_info['kis_access_token']}",
-            "appkey": user_info["kis_app_key"],
-            "appsecret": user_info["kis_app_secret"],
-            "tr_id": tr_id,
-            "custtype": "P",
-        }
-        params = {
-            "CANO": account_no.split("-")[0],
-            "ACNT_PRDT_CD": account_no.split("-")[1],
-            "AFHR_FLPR_YN": "N",
-            "OFL_YN": "",
-            "INQR_DVSN": "01",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "01",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
+        open-trading-api의 `auth()` 구현처럼, **환경(prod/vps)에 맞는 도메인에서** `/oauth2/tokenP`를 호출해야 합니다.
+        """
+        b = (base_url or "").strip().rstrip("/")
+        if not b:
+            raise ValueError("base_url이 비어있습니다.")
+        url = f"{b}/oauth2/tokenP"
+        headers = {"content-type": "application/json"}
+        body = {
+            "grant_type": "client_credentials",
+            "appkey": app_key,
+            "appsecret": app_secret,
         }
 
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            await self._throttle()
-            async with session.get(url, headers=headers, params=params) as response:
-                text = await response.text()
+            async with session.post(url, headers=headers, json=body) as res:
+                text = await res.text()
+                if res.status != 200:
+                    raise ValueError(f"KIS token 발급 실패({res.status}): {text[:200]}")
                 try:
-                    res_data = json.loads(text)
+                    data = json.loads(text)
                 except Exception:
-                    raise ValueError(f"KIS holdings 응답 파싱 실패: {text[:200]}")
+                    raise ValueError(f"KIS token 응답 파싱 실패: {text[:200]}")
+                token = str(data.get("access_token", "") or "").strip()
+                if not token:
+                    raise ValueError(f"KIS token 응답에 access_token이 없습니다: {text[:200]}")
+                return token
 
-                if res_data.get("rt_cd") != "0":
-                    raise ValueError(
-                        f"KIS holdings API 오류: {res_data.get('msg1', '알 수 없는 오류')}"
-                    )
+    @staticmethod
+    def _split_account_no(account_no: str) -> tuple[str, str]:
+        """account_no를 (CANO, ACNT_PRDT_CD)로 분리합니다.
 
-                holdings = []
-                for item in res_data.get("output1", []) or []:
-                    try:
-                        quantity = int(item.get("hldg_qty", "0"))
-                    except Exception:
-                        quantity = 0
-                    if quantity <= 0:
-                        continue
+        허용 포맷:
+        - "12345678-01" (권장)
+        - "1234567801" (대시 없이 10자리)
+        - 공백/구분자 포함 (숫자만 추출하여 처리)
+        """
+        raw = (account_no or "").strip()
+        if not raw:
+            raise ValueError("account_no가 비어있습니다. (예: 12345678-01)")
 
-                    code = str(item.get("pdno", "") or "")
-                    name = str(item.get("prdt_name", "") or "")
-                    try:
-                        avg_buy_price = float(item.get("pchs_avg_pric", "0") or 0)
-                    except Exception:
-                        avg_buy_price = 0.0
-                    try:
-                        current_price = float(item.get("prpr", "0") or 0)
-                    except Exception:
-                        current_price = 0.0
-                    try:
-                        evaluated_amount = float(item.get("evlu_amt", "0") or 0)
-                    except Exception:
-                        evaluated_amount = 0.0
-                    try:
-                        profit_loss = float(item.get("evlu_pfls_amt", "0") or 0)
-                    except Exception:
-                        profit_loss = 0.0
+        if "-" in raw:
+            cano, prdt = raw.split("-", 1)
+        else:
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if len(digits) < 10:
+                raise ValueError("account_no 형식이 올바르지 않습니다. (예: 12345678-01)")
+            cano, prdt = digits[:8], digits[8:10]
 
-                    return_rate = (
-                        (current_price - avg_buy_price) / avg_buy_price
-                        if avg_buy_price > 0
-                        else 0.0
-                    )
-                    holdings.append(
-                        {
-                            "code": code,
-                            "name": name,
-                            "quantity": quantity,
-                            "avg_buy_price": avg_buy_price,
-                            "current_price": current_price,
-                            "return_rate": return_rate,
-                            "evaluated_amount": evaluated_amount,
-                            "profit_loss": profit_loss,
+        cano = (cano or "").strip()
+        prdt = (prdt or "").strip()
+        if not (cano.isdigit() and len(cano) == 8 and prdt.isdigit() and len(prdt) == 2):
+            raise ValueError("account_no 형식이 올바르지 않습니다. (예: 12345678-01)")
+        return cano, prdt
+
+    async def _fetch_user_holdings(self, base_url: str, tr_id: str, user_info: dict) -> dict:
+        """(내부) 특정 base_url/TR로 기보유 종목을 조회합니다."""
+        account_no = user_info.get("account_no") or ""
+        cano, acnt_prdt_cd = self._split_account_no(str(account_no))
+
+        url = base_url.rstrip("/") + "/uapi/domestic-stock/v1/trading/inquire-balance"
+        # NOTE:
+        # KIS API gateway는 User-Agent가 없을 때 입력 검증이 달라지는 사례가 있어(공식 샘플도 UA 지정),
+        # 기본 User-Agent를 포함합니다.
+        user_agent = (os.getenv("KIS_USER_AGENT") or "").strip() or "Mozilla/5.0"
+        headers_common = {
+            "Content-Type": "application/json",
+            "Accept": "text/plain",
+            "charset": "UTF-8",
+            "User-Agent": user_agent,
+            "authorization": f"Bearer {user_info['kis_access_token']}",
+            "tr_id": tr_id,
+            "custtype": "P",
+        }
+        # 일부 샘플/노드 구현에서 appKey/appSecret 케이스를 사용하므로, 호환을 위해 2가지 형태를 순차 시도합니다.
+        header_variants = [
+            {"appkey": user_info["kis_app_key"], "appsecret": user_info["kis_app_secret"]},
+            {"appKey": user_info["kis_app_key"], "appSecret": user_info["kis_app_secret"]},
+        ]
+        # NOTE: inquire-balance 파라미터는 샘플/레거시에서 약간씩 차이가 있습니다.
+        # - examples_llm/postman: OFL_YN="" / PRCS_DVSN="00"
+        # - legacy(rest):        OFL_YN="N" / PRCS_DVSN="01"
+        #
+        # 일부 계정/환경에서 입력 검증이 엄격하게 동작할 수 있어, 두 조합을 순차 시도합니다.
+        base_params_candidates: list[dict] = [
+            {
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "AFHR_FLPR_YN": "N",
+                "OFL_YN": "",
+                "INQR_DVSN": "01",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                # 00: 전일매매포함, 01: 전일매매미포함
+                "PRCS_DVSN": "00",
+            },
+            {
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "AFHR_FLPR_YN": "N",
+                "OFL_YN": "N",
+                "INQR_DVSN": "01",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "01",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            },
+        ]
+
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            last_err: Exception | None = None
+
+            for base_params in base_params_candidates:
+                for header_variant in header_variants:
+                    # 시도 단위마다 헤더를 새로 구성(토큰 갱신/재시도 시에도 해당 헤더를 업데이트)
+                    headers = dict(headers_common)
+                    headers.update(header_variant)
+                    try:
+                        holdings: list[dict] = []
+                        summary: dict | None = None
+                        token_refreshed = False
+
+                        # 연속조회 키
+                        fk100 = ""
+                        nk100 = ""
+                        prev_cursor = None
+                        max_pages = 10  # 안전장치
+                        tr_cont_req = ""  # 1페이지: 공백, 다음 페이지: "N"
+
+                        for _ in range(max_pages):
+                            params = dict(base_params)
+                            params["CTX_AREA_FK100"] = fk100
+                            params["CTX_AREA_NK100"] = nk100
+
+                            await self._throttle()
+                            headers["tr_cont"] = tr_cont_req
+                            async with session.get(
+                                url, headers=headers, params=params
+                            ) as response:
+                                status_code = response.status
+                                resp_tr_cont = (
+                                    str(response.headers.get("tr_cont", "") or "").strip()
+                                )
+                                text = await response.text()
+
+                            # 토큰 만료/무효: 1회 재발급 후 재시도
+                            if status_code in (401, 403, 500) and (
+                                "기간이 만료된 token" in text or "유효하지 않은 token" in text
+                            ):
+                                user_info["kis_access_token"] = (
+                                    await self._issue_access_token_for_base(
+                                        base_url,
+                                        user_info["kis_app_key"],
+                                        user_info["kis_app_secret"],
+                                    )
+                                )
+                                token_refreshed = True
+                                headers["authorization"] = (
+                                    f"Bearer {user_info['kis_access_token']}"
+                                )
+
+                                await self._throttle()
+                                headers["tr_cont"] = tr_cont_req
+                                async with session.get(
+                                    url, headers=headers, params=params
+                                ) as res_refresh:
+                                    resp_tr_cont = (
+                                        str(
+                                            res_refresh.headers.get("tr_cont", "") or ""
+                                        ).strip()
+                                    )
+                                    text = await res_refresh.text()
+
+                            try:
+                                res_data = json.loads(text)
+                            except Exception:
+                                raise ValueError(
+                                    f"KIS holdings 응답 파싱 실패: {text[:200]}"
+                                )
+
+                            if res_data.get("rt_cd") != "0":
+                                raise ValueError(
+                                    f"KIS holdings API 오류: {res_data.get('msg1', '알 수 없는 오류')}"
+                                )
+
+                            for item in res_data.get("output1", []) or []:
+                                try:
+                                    quantity = int(item.get("hldg_qty", "0"))
+                                except Exception:
+                                    quantity = 0
+                                if quantity <= 0:
+                                    continue
+
+                                code = str(item.get("pdno", "") or "")
+                                name = str(item.get("prdt_name", "") or "")
+                                try:
+                                    avg_buy_price = float(
+                                        item.get("pchs_avg_pric", "0") or 0
+                                    )
+                                except Exception:
+                                    avg_buy_price = 0.0
+                                try:
+                                    current_price = float(item.get("prpr", "0") or 0)
+                                except Exception:
+                                    current_price = 0.0
+                                try:
+                                    evaluated_amount = float(item.get("evlu_amt", "0") or 0)
+                                except Exception:
+                                    evaluated_amount = 0.0
+                                try:
+                                    profit_loss = float(
+                                        item.get("evlu_pfls_amt", "0") or 0
+                                    )
+                                except Exception:
+                                    profit_loss = 0.0
+
+                                return_rate = (
+                                    (current_price - avg_buy_price) / avg_buy_price
+                                    if avg_buy_price > 0
+                                    else 0.0
+                                )
+                                holdings.append(
+                                    {
+                                        "code": code,
+                                        "name": name,
+                                        "quantity": quantity,
+                                        "avg_buy_price": avg_buy_price,
+                                        "current_price": current_price,
+                                        "return_rate": return_rate,
+                                        "evaluated_amount": evaluated_amount,
+                                        "profit_loss": profit_loss,
+                                    }
+                                )
+
+                            # output2 요약
+                            try:
+                                out2 = (res_data.get("output2") or [])
+                                if out2:
+                                    summary = dict(out2[0])
+                            except Exception:
+                                summary = summary
+
+                            fk100 = str(res_data.get("ctx_area_fk100", "") or "").strip()
+                            nk100 = str(res_data.get("ctx_area_nk100", "") or "").strip()
+                            cursor = (fk100, nk100)
+
+                            if (
+                                resp_tr_cont in {"M", "F"}
+                                and (fk100 or nk100)
+                                and cursor != prev_cursor
+                            ):
+                                tr_cont_req = "N"
+                                prev_cursor = cursor
+                                continue
+                            break
+
+                        return {
+                            "holdings": holdings,
+                            "summary": summary,
+                            "token_refreshed": token_refreshed,
                         }
-                    )
+                    except Exception as e:
+                        last_err = e
+                        # 계좌 입력 검증 오류는 다음 조합(파라미터/헤더)로 재시도
+                        if "INVALID_CHECK_ACNO" in str(e):
+                            continue
+                        # 그 외 오류는 즉시 중단
+                        raise
 
-                summary = None
-                try:
-                    out2 = (res_data.get("output2") or [])
-                    if out2:
-                        summary = dict(out2[0])
-                except Exception:
-                    summary = None
-
-                return {"holdings": holdings, "summary": summary}
+            raise last_err or ValueError("KIS holdings 조회 실패")
 
     async def get_user_holdings(self, user_info: dict) -> dict:
         """유저의 기보유 종목(계좌 보유 현황)을 조회합니다.
@@ -367,37 +555,32 @@ class PortfolioAnalysisTool(BaseTool):
               "summary": { ... } | None
             }
         """
-        # 1) 현재 설정(base_url/tr_id)로 먼저 시도
-        base_url = self.url_base
-        tr_id = self._get_kis_trading_id()
-        try:
-            return await self._fetch_user_holdings(base_url, tr_id, user_info)
-        except Exception as e:
-            msg = str(e)
+        # NOTE: account_no는 "무조건 모의(VTS)" 계좌라는 전제.
+        # - base_url=openapivts
+        # - tr_id=VTTC8434R
+        base_url = "https://openapivts.koreainvestment.com:29443"
+        tr_id = "VTTC8434R"
 
-            # 2) 환경(TR) 불일치 시 자동 폴백
-            # - "모의투자 TR 이 아닙니다." : 실전 TR을 모의 환경에 보낸 경우 → 모의 환경으로 재시도
-            # - "실전투자 TR 이 아닙니다." : 모의 TR을 실전 환경에 보낸 경우 → 실전 환경으로 재시도
-            if "모의투자 TR" in msg:
-                try:
-                    return await self._fetch_user_holdings(
-                        "https://openapivts.koreainvestment.com:29443",
-                        "VTTC8434R",
-                        user_info,
-                    )
-                except Exception:
-                    raise e
-            if "실전투자 TR" in msg:
-                try:
-                    return await self._fetch_user_holdings(
-                        "https://openapi.koreainvestment.com:9443",
-                        "TTTC8434R",
-                        user_info,
-                    )
-                except Exception:
-                    raise e
+        # 1) DB에 저장된 토큰이 있으면 먼저 사용(토큰 발급은 1분당 1회 제한이 있을 수 있음)
+        token_in_db = str(user_info.get("kis_access_token", "") or "").strip()
+        if token_in_db:
+            user_info["kis_access_token"] = token_in_db
+            try:
+                return await self._fetch_user_holdings(base_url, tr_id, user_info)
+            except Exception as e:
+                # 계좌/환경 불일치 시, VTS 도메인에서 토큰을 다시 발급받아 1회 재시도
+                if "INVALID_CHECK_ACNO" not in str(e):
+                    raise
 
-            raise e
+        # 2) 토큰이 없거나, 1차 시도가 INVALID_CHECK_ACNO 였던 경우: VTS 토큰 재발급 후 재시도
+        user_info["kis_access_token"] = await self._issue_access_token_for_base(
+            base_url, user_info["kis_app_key"], user_info["kis_app_secret"]
+        )
+        out = await self._fetch_user_holdings(base_url, tr_id, user_info)
+        # get_user_holdings 레벨에서 토큰을 새로 발급했으므로 토큰 갱신 플래그를 보정
+        if isinstance(out, dict):
+            out["token_refreshed"] = True
+        return out
 
     def _ensure_dart_client(self):
         """DART 클라이언트/락을 지연 초기화합니다.
@@ -646,6 +829,37 @@ class PortfolioAnalysisTool(BaseTool):
         return result
         
 
+    async def get_kis_inquire_price(
+        self, symbol: str, user_info: dict
+    ) -> tuple[dict, bool, dict]:
+        """KIS '주식현재가 시세'로 업종/시장 정보를 조회합니다.
+
+        공식 샘플(open-trading-api)에서 `bstp_kor_isnm`(업종 한글 종목명)을 사용합니다.
+        - endpoint: /uapi/domestic-stock/v1/quotations/inquire-price
+        - tr_id: FHKST01010100 (모의/실전 동일)
+        """
+        url = f"{self.url_base}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = self._make_headers("FHKST01010100", user_info)
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+        }
+
+        data, update_access_token_flag, user_info = await self._kis_get_json(
+            url,
+            headers,
+            params,
+            user_info,
+            endpoint="inquire-price",
+            symbol=symbol,
+        )
+        output = (data or {}).get("output") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        if not isinstance(output, dict):
+            output = {}
+        return output, update_access_token_flag, user_info
+
     async def get_stability_ratio(self, symbol: str, div_cd: str = "0", user_info=None):
         """국내주식 안정성 비율 조회"""
         url = f"{self.url_base}/uapi/domestic-stock/v1/finance/stability-ratio"
@@ -868,6 +1082,29 @@ class PortfolioAnalysisTool(BaseTool):
         should_update_access_token = False
 
         stock_info = await self.get_stock_basic_info(symbol)
+        sector = str(stock_info.get("induty_name", "") or "").strip() or "N/A"
+        market = str(stock_info.get("market", "") or "").strip() or "N/A"
+
+        # 업종명(섹터) 폴백: KSIC DB가 없으면 DART에서는 코드만 있어 N/A가 되기 쉬움.
+        # open-trading-api 샘플의 inquire-price 응답 `bstp_kor_isnm`를 사용합니다.
+        if sector == "N/A":
+            try:
+                price_out, update_access_token_flag, user_info = await self.get_kis_inquire_price(
+                    symbol, user_info
+                )
+                should_update_access_token |= update_access_token_flag
+                sector_from_kis = str(price_out.get("bstp_kor_isnm", "") or "").strip()
+                if sector_from_kis:
+                    sector = sector_from_kis
+
+                # 시장명도 비어있을 때만 보조로 채움
+                if market == "N/A":
+                    market_from_kis = str(price_out.get("rprs_mrkt_kor_name", "") or "").strip()
+                    if market_from_kis:
+                        market = market_from_kis
+            except Exception:
+                # 업종 폴백 실패해도 추천 전체는 계속 진행
+                pass
 
         stability_score, stability_data, update_access_token_flag, user_info = await self.get_stability_ratio(symbol, user_info=user_info)
         should_update_access_token |= update_access_token_flag
@@ -892,8 +1129,8 @@ class PortfolioAnalysisTool(BaseTool):
         analysis_result = {
             "symbol": symbol,
             "name": stock_info.get("corp_name"),
-            "market": stock_info.get("market"),
-            "sector": stock_info.get("induty_name"),
+            "market": market,
+            "sector": sector,
             "total_score": float(total_score),
             "stability_score": float(stability_score),
             "profit_score": float(profit_score),
@@ -924,10 +1161,14 @@ class PortfolioAnalysisTool(BaseTool):
         logger.info("Analyzing portfolio for risk level: %s with top N: %d", risk_level, top_n)
         # 0. 기보유 종목 조회(가능하면)
         holdings_payload: dict | None = None
+        holdings_error: str | None = None
+        holdings_token_refreshed = False
         try:
             holdings_payload = await self.get_user_holdings(user_info)
+            holdings_token_refreshed = bool((holdings_payload or {}).get("token_refreshed"))
         except Exception as e:
             # holdings 조회 실패해도 추천 전체는 계속 진행
+            holdings_error = str(e)
             logger.warning("Failed to fetch user holdings; proceed without holdings. err=%s", e)
 
         holdings_list = (holdings_payload or {}).get("holdings") or []
@@ -936,7 +1177,7 @@ class PortfolioAnalysisTool(BaseTool):
         # 1. 시가총액 상위 종목 조회
         ranking, update_access_token_flag, user_info = await self.get_top_market_value(fid_rank_sort_cls_code='23', user_info=user_info)
         portfolio_data = []
-        should_update_access_token = update_access_token_flag
+        should_update_access_token = update_access_token_flag or holdings_token_refreshed
 
         tasks = []
         # 2. 각 종목별 지표 분석
@@ -999,6 +1240,7 @@ class PortfolioAnalysisTool(BaseTool):
         # 보고서용 메타/기보유 종목 포함
         rec["holdings"] = holdings_list
         rec["holdings_summary"] = (holdings_payload or {}).get("summary")
+        rec["holdings_error"] = holdings_error
 
         # 기보유 종목이 최종 추천에 포함됐는지 표시
         rec_codes = {x.get("symbol") for x in rec.get("recommendations", [])}
@@ -1173,11 +1415,22 @@ class PortfolioAnalysisTool(BaseTool):
         portfolio_size = analysis_result.get("portfolio_size", 0)
         recommendations = analysis_result.get("recommendations", [])
         holdings = analysis_result.get("holdings", []) or []
+        holdings_summary = analysis_result.get("holdings_summary") or {}
         holdings_included = analysis_result.get("holdings_included", []) or []
         holdings_excluded = analysis_result.get("holdings_excluded", []) or []
         universe_size = analysis_result.get("analysis_universe_size", None)
         top_n_market_cap = analysis_result.get("analysis_top_n_market_cap", None)
         generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        def _fmt_money(v: object) -> str:
+            s = str(v or "").strip()
+            if not s:
+                return ""
+            try:
+                n = float(s.replace(",", ""))
+                return f"{n:,.0f}원"
+            except Exception:
+                return s
         
         # 마크다운 시작(보고서)
         markdown = "# 포트폴리오 추천 보고서\n\n"
@@ -1191,10 +1444,33 @@ class PortfolioAnalysisTool(BaseTool):
         # 1) 기보유 종목 섹션
         markdown += "## 1) 기보유 종목 현황\n\n"
         if not holdings:
-            markdown += "- 현재 기보유 종목이 없거나, 계좌 조회 결과가 없습니다.\n\n"
+            markdown += "- 현재 기보유 종목이 없거나, 계좌 조회 결과가 없습니다.\n"
+            holdings_error = str(analysis_result.get("holdings_error", "") or "").strip()
+            if holdings_error:
+                # 메시지가 너무 길어 UI를 깨지 않도록 제한
+                holdings_error = holdings_error[:200]
+                markdown += f"- 계좌 조회 실패 사유: {holdings_error}\n"
+            # 조회가 성공했지만 보유 종목이 0개인 경우에도 output2 요약은 있을 수 있음
+            if isinstance(holdings_summary, dict) and holdings_summary:
+                cash = _fmt_money(holdings_summary.get("dnca_tot_amt"))
+                total_eval = _fmt_money(holdings_summary.get("tot_evlu_amt"))
+                if cash:
+                    markdown += f"- 예수금총금액(dnca_tot_amt): {cash}\n"
+                if total_eval:
+                    markdown += f"- 총평가금액(tot_evlu_amt): {total_eval}\n"
+            markdown += "\n"
         else:
             markdown += f"- 기보유 종목: **{len(holdings)}개**\n"
             markdown += f"- 최종 추천 포트폴리오에 포함: **{len(holdings_included)}개**, 제외: **{len(holdings_excluded)}개**\n\n"
+            if isinstance(holdings_summary, dict) and holdings_summary:
+                cash = _fmt_money(holdings_summary.get("dnca_tot_amt"))
+                total_eval = _fmt_money(holdings_summary.get("tot_evlu_amt"))
+                if cash or total_eval:
+                    if cash:
+                        markdown += f"- 예수금총금액(dnca_tot_amt): {cash}\n"
+                    if total_eval:
+                        markdown += f"- 총평가금액(tot_evlu_amt): {total_eval}\n"
+                    markdown += "\n"
 
             markdown += "| 종목명 | 종목코드 | 보유수량 | 평균단가 | 현재가 | 수익률 | 평가금액 | 평가손익 | 최종포트폴리오 |\n"
             markdown += "|:---|:---:|---:|---:|---:|---:|---:|---:|:---:|\n"
@@ -1216,12 +1492,11 @@ class PortfolioAnalysisTool(BaseTool):
 
         # 2) 추천 프로세스 설명
         markdown += "## 2) 추천 프로세스(요약)\n\n"
-        markdown += "- **투자 성향 산출**: `public.survey.answer(q1~q8)`를 점수화하여 투자 성향(안정형~공격투자형)을 결정합니다.\n"
-        markdown += "- **기보유 종목 반영**: 계좌 보유 종목을 조회한 뒤, **보유 종목을 최종 포트폴리오의 베이스로 포함**하고 부족분만 신규로 추천합니다.\n"
-        markdown += "  - 단, 보유 종목 수가 요청 개수보다 많으면 보유 종목 중 종합점수 상위 N개로 축소합니다.\n"
-        markdown += "- **후보군 구성**: 시가총액 상위 종목 + 기보유 종목을 합쳐 분석 후보군을 만듭니다.\n"
-        markdown += "- **지표 계산/스코어링**: 안정성/수익성/성장성/주요지표/재무비율 지표를 계산하고, 투자 성향별 가중치로 종합점수를 산출합니다.\n"
-        markdown += "- **최종 선정/비중 산출**: 종합점수 상위 **N개(요청 개수)**를 선정하고, 종합점수 비율로 투자 비중(%)을 계산합니다.\n\n"
+        markdown += "- **투자 성향 산출**: 설문(`public.survey.answer`) 기반으로 투자 성향을 결정합니다.\n"
+        markdown += "- **기보유 종목 조회(모의투자)**: KIS 잔고 조회로 기보유 종목을 확인합니다.\n"
+        markdown += "- **후보군 구성**: 시가총액 상위 종목 + 기보유 종목으로 분석 후보군을 구성합니다.\n"
+        markdown += "- **종목 분석/점수화**: 재무·지표 데이터를 수집해 종목별 점수를 계산합니다.\n"
+        markdown += "- **최종 추천/비중 산출**: 점수 상위 종목으로 포트폴리오를 구성하고 비중을 계산합니다.\n\n"
         markdown += "---\n\n"
         
         # 3) 최종 추천 포트폴리오(마지막)
@@ -1281,26 +1556,11 @@ class PortfolioAnalysisTool(BaseTool):
         if not user_info:
             raise ValueError(f"user_id={user_id} 사용자를 DB에서 찾지 못했습니다.")
 
-        # DB에 저장된 토큰이 있으면 재사용하고,
-        # 없으면 app_key/app_secret으로 발급받아 user.kis_access_token에 저장합니다.
-        access_token = user_info.get("kis_access_token")
-        if not access_token:
-            access_token = await get_access_token(
-                user_info["kis_app_key"], user_info["kis_app_secret"]
-            )
-            if not access_token:
-                raise ValueError(
-                    "KIS access token 발급에 실패했습니다. KIS 키를 확인해주세요."
-                )
-            user_info["kis_access_token"] = access_token
-            try:
-                from multi_agent.utils import update_user_kis_credentials
-
-                await update_user_kis_credentials(
-                    get_async_engine(), user_id, access_token
-                )
-            except Exception as e:
-                logger.warning("Failed to persist issued KIS access token to DB: %s", e)
+        # user_id 기준으로 DB 토큰 재사용 + 만료/무효 시 재발급 후 DB 업데이트
+        access_token = await ensure_user_kis_access_token(
+            get_async_engine(), user_id, user_info, validate=True
+        )
+        user_info["kis_access_token"] = access_token
         
         # 포트폴리오 분석 실행
         analysis_result = await self.analyze_portfolio(

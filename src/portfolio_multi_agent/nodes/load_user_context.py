@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from multi_agent.utils import (
     get_access_token,
     get_user_kis_credentials,
+    ensure_user_kis_access_token,
     update_user_kis_credentials,
 )
 
@@ -68,16 +69,12 @@ class LoadUserContext:
         if not user_info.get("account_no"):
             raise ValueError("user.account_no가 비어있습니다.")
 
-        # DB에 저장된 토큰이 있으면 그대로 사용하고,
-        # 없으면 app_key/app_secret으로 access_token을 발급받아 DB에 저장합니다.
-        access_token = user_info.get("kis_access_token")
-        if not access_token:
-            access_token = await get_access_token(
-                user_info["kis_app_key"], user_info["kis_app_secret"]
-            )
-            if not access_token:
-                raise ValueError("KIS access token 발급 실패 (app_key/app_secret 확인 필요)")
-            await update_user_kis_credentials(engine, state.user_id, access_token)
+        # user_id 기준으로 DB에서 KIS 자격증명/토큰을 조회하고,
+        # - 토큰이 없으면 발급 후 DB 업데이트
+        # - 토큰이 "만료/무효"면(시세 API로 검증) 재발급 후 DB 업데이트
+        access_token = await ensure_user_kis_access_token(
+            engine, state.user_id, user_info, validate=True
+        )
 
         return {
             "kis_app_key": user_info["kis_app_key"],

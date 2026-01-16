@@ -30,7 +30,10 @@ async def get_stability_rank(
     _app_secret = app_secret
     _access_token = access_token
 
-    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/ranking/finance-ratio"
+    base_url = (
+        os.getenv("KIS_API_BASE_URL") or "https://openapivts.koreainvestment.com:29443"
+    ).rstrip("/")
+    url = f"{base_url}/uapi/domestic-stock/v1/ranking/finance-ratio"
     headers = {
         "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {_access_token}",

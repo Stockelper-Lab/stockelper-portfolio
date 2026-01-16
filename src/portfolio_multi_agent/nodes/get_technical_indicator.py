@@ -30,7 +30,7 @@ class TechnicalIndicator:
     def __init__(self):
         """
         기술적 지표 분석 및 시장 데이터 로더
-        (최근 30일 데이터 사용)
+        (최근 180일 데이터 사용)
         """
         pass
 
@@ -127,33 +127,94 @@ class TechnicalIndicator:
         self, stock_code: str, app_key: str, app_secret: str, acc_no: str
     ) -> pd.DataFrame | None:
         """
-        한국투자증권 API를 사용하여 주식 일별 데이터 조회 (mojito 라이브러리 사용, 최근 30일 고정)
+        한국투자증권 API를 사용하여 주식 일별 데이터 조회 (mojito 라이브러리 사용, 최근 180일)
+
+        - KIS 기간별 시세 API는 1회 호출에 최대 100건까지 내려올 수 있어,
+          오래된 데이터는 end_day를 뒤로 옮기며 여러 번 호출해 누적합니다.
         """
         if not all([app_key, app_secret, acc_no]):
             return None
 
-        # mojito 브로커 객체 생성
+        # mojito 브로커 객체 생성 (모의투자 기준)
         broker = mojito.KoreaInvestment(
-            api_key=app_key, api_secret=app_secret, acc_no=acc_no
+            api_key=app_key,
+            api_secret=app_secret,
+            acc_no=acc_no,
+            mock=True,
         )
 
-        # 최근 30일 데이터 조회 (fetch_ohlcv_recent30 사용)
-        resp = broker.fetch_ohlcv_recent30(stock_code)
+        target_days = 180
+        max_pages = 5  # 100건 * 2면 180일 커버 가능하나 안전장치로 여유를 둠
+        end_day = datetime.now().strftime("%Y%m%d")
+        start_day = "19800104"  # 충분히 과거
 
-        # 응답 데이터 확인
-        data = resp.get("output", [])
-        if not data:
+        rows: list[dict] = []
+        seen_dates: set[str] = set()
+
+        for _ in range(max_pages):
+            resp = broker.fetch_ohlcv_domestic(
+                stock_code,
+                timeframe="D",
+                start_day=start_day,
+                end_day=end_day,
+                adj_price=True,
+            )
+
+            if not isinstance(resp, dict) or str(resp.get("rt_cd", "")).strip() != "0":
+                return None
+
+            output2 = resp.get("output2") or []
+            if not output2:
+                break
+
+            # 누적 (중복 일자 제거)
+            for item in output2:
+                d = str(item.get("stck_bsop_date", "") or "").strip()
+                if not d or d in seen_dates:
+                    continue
+                seen_dates.add(d)
+                rows.append(item)
+
+            # 이미 충분히 모이면 종료
+            if len(seen_dates) >= target_days + 20:
+                break
+
+            # 다음 페이지: 이번 배치에서 가장 오래된 날짜 이전으로 end_day 이동
+            dates = [
+                str(item.get("stck_bsop_date", "") or "").strip()
+                for item in output2
+                if item.get("stck_bsop_date")
+            ]
+            if not dates:
+                break
+
+            oldest = min(dates)
+            try:
+                prev = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime(
+                    "%Y%m%d"
+                )
+            except Exception:
+                break
+
+            if prev >= end_day:
+                break
+            end_day = prev
+
+        if not rows:
             return None
 
-        # 데이터 정리
+        # DataFrame 생성
         df_data = []
-        for item in data:
-            date = pd.to_datetime(item["stck_bsop_date"])
-            open_price = float(item["stck_oprc"])
-            high_price = float(item["stck_hgpr"])
-            low_price = float(item["stck_lwpr"])
-            close_price = float(item["stck_clpr"])
-            volume = int(item["acml_vol"])
+        for item in rows:
+            try:
+                date = pd.to_datetime(item["stck_bsop_date"])
+                open_price = float(item.get("stck_oprc", 0) or 0)
+                high_price = float(item.get("stck_hgpr", 0) or 0)
+                low_price = float(item.get("stck_lwpr", 0) or 0)
+                close_price = float(item.get("stck_clpr", 0) or 0)
+                volume = int(float(item.get("acml_vol", 0) or 0))
+            except Exception:
+                continue
 
             df_data.append(
                 {
@@ -166,10 +227,15 @@ class TechnicalIndicator:
                 }
             )
 
-        # DataFrame 생성
-        df = pd.DataFrame(df_data)
-        df = df.set_index("Date")
-        df = df.sort_index()  # 날짜 순으로 정렬
+        if not df_data:
+            return None
+
+        df = pd.DataFrame(df_data).set_index("Date").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+
+        # 최근 180개로 제한
+        if len(df) > target_days:
+            df = df.iloc[-target_days:]
 
         return df
 
@@ -231,6 +297,8 @@ class TechnicalIndicator:
 
         # 이동평균선
         ma20 = df["Close"].rolling(window=20).mean()
+        ma60 = df["Close"].rolling(window=60).mean()
+        ma120 = df["Close"].rolling(window=120).mean()
 
         # 최근 데이터 (가장 최신)
         if df.empty:
@@ -246,6 +314,11 @@ class TechnicalIndicator:
         latest_bb_middle = bb_middle.iloc[-1]
         latest_bb_lower = bb_lower.iloc[-1]
         latest_ma20 = ma20.iloc[-1]
+        latest_ma60 = ma60.iloc[-1]
+        latest_ma120 = ma120.iloc[-1]
+
+        def _fmt_ma(x: float) -> str:
+            return f"{x:.2f}원" if pd.notna(x) else "N/A"
 
         indicators = {
             "현재가": f"{latest['Close']:.2f}원",
@@ -258,7 +331,9 @@ class TechnicalIndicator:
             "볼린저밴드 상단": f"{latest_bb_upper:.2f}원",
             "볼린저밴드 중간": f"{latest_bb_middle:.2f}원",
             "볼린저밴드 하단": f"{latest_bb_lower:.2f}원",
-            "이동평균(20일)": f"{latest_ma20:.2f}원",
+            "이동평균(20일)": _fmt_ma(latest_ma20),
+            "이동평균(60일)": _fmt_ma(latest_ma60),
+            "이동평균(120일)": _fmt_ma(latest_ma120),
             "거래량": f"{latest['Volume']:,}",
         }
 
@@ -303,7 +378,9 @@ class TechnicalIndicator:
         indicators = self.calculate_indicators(df)
 
         # 지표를 텍스트로 포맷팅
-        indicator_text = f"{stock.name}({stock.code}) 기술적 지표 (최근 30일 기준):\n\n"
+        indicator_text = (
+            f"{stock.name}({stock.code}) 기술적 지표 (최근 {len(df)}일 데이터 기준, 최대 180일):\n\n"
+        )
         if indicators:
             for key, value in indicators.items():
                 indicator_text += f"- {key}: {value}\n"

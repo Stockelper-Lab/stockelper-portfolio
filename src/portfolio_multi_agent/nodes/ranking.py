@@ -34,6 +34,41 @@ class OutputState(BaseModel):
 class Ranking:
     name = "Ranking"
 
+    @staticmethod
+    def _is_etf_or_etn(name: str) -> bool:
+        """ETF/ETN(및 대표 브랜드)을 간단히 제외하기 위한 휴리스틱.
+
+        NOTE: 랭킹 API의 market 구분이 'J'여도 일부 상품이 섞일 수 있어 2중 방어로 둡니다.
+        """
+        raw = (name or "").strip()
+        if not raw:
+            return False
+        up = raw.upper()
+        # 명시적 표기
+        if "ETF" in up or "ETN" in up:
+            return True
+        # 국내 ETF 대표 브랜드/키워드
+        if any(
+            k in up
+            for k in [
+                "KODEX",
+                "TIGER",
+                "KOSEF",
+                "KBSTAR",
+                "ARIRANG",
+                "HANARO",
+                "KINDEX",
+                "TIMEFOLIO",
+                "ACE",
+                "SOL",
+            ]
+        ):
+            return True
+        # 레버리지/인버스 등 ETF에 흔한 키워드
+        if any(k in raw for k in ["레버리지", "인버스"]):
+            return True
+        return False
+
     async def __call__(self, state: InputState) -> OutputState:
         # 1. API 인증 정보 로드 (DB에서 로드된 값)
         creds = self._get_api_credentials(state)
@@ -193,13 +228,18 @@ class Ranking:
         # 점수 기준으로 정렬 (높을수록 좋음, 내림차순)
         sorted_stocks = sorted(stock_scores.items(), key=lambda x: x[1], reverse=True)
 
-        # 상위 max_portfolio_size 개의 종목 정보 추출
-        top_stocks = [
-            Stock(code=code, name=stock_info[code])
-            for code, _ in sorted_stocks[:max_size]
-        ]
+        top_stocks: List[Stock] = []
+        top_stock_scores: Dict[str, float] = {}
 
-        # 상위 종목들의 점수만 추출
-        top_stock_scores = {code: score for code, score in sorted_stocks[:max_size]}
+        for code, score in sorted_stocks:
+            name = stock_info.get(code, "")
+            # ETF/ETN 제외
+            if self._is_etf_or_etn(name):
+                continue
+
+            top_stocks.append(Stock(code=code, name=name))
+            top_stock_scores[code] = score
+            if len(top_stocks) >= max_size:
+                break
 
         return top_stocks, top_stock_scores
