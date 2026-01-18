@@ -32,6 +32,7 @@ dependencies = [
     "matplotlib",
     "mojito2",
     "python-dotenv",
+    "openai-agents>=0.6.7",
 ]
 
 [project.optional-dependencies]

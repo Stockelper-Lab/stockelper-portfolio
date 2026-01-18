@@ -17,6 +17,7 @@ from multi_agent.utils import (
     survey_answer_to_investor_type,
     update_portfolio_recommendation_job,
 )
+from portfolio_agents import PortfolioAgentsManager
 from portfolio_multi_agent.builder import build_buy_workflow, build_sell_workflow
 from portfolio_multi_agent.state import BuyInputState, SellInputState
 
@@ -25,6 +26,7 @@ router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 _ENGINE = None
 _BUY_WORKFLOW = None
 _SELL_WORKFLOW = None
+_AGENTS_MANAGER = None
 
 
 def _to_async_db_url(url: Optional[str]) -> Optional[str]:
@@ -70,6 +72,23 @@ def _get_sell_workflow():
     return _SELL_WORKFLOW
 
 
+def _get_agents_manager() -> PortfolioAgentsManager:
+    global _AGENTS_MANAGER
+    if _AGENTS_MANAGER is None:
+        _AGENTS_MANAGER = PortfolioAgentsManager()
+    return _AGENTS_MANAGER
+
+
+def _use_openai_agents_for_recommendations() -> bool:
+    # 기본은 기존 로직(PortfolioAnalysisTool) 유지.
+    # 운영에서 단계적 전환을 위해 환경변수로만 스위치합니다.
+    raw = (os.getenv("PORTFOLIO_RECOMMENDATIONS_ENGINE") or "").strip().lower()
+    if raw in {"agents", "openai-agents", "openai_agents"}:
+        return True
+    raw2 = (os.getenv("PORTFOLIO_USE_OPENAI_AGENTS") or "").strip().lower()
+    return raw2 in {"1", "true", "yes", "y", "on"}
+
+
 class PortfolioRecommendationRequest(BaseModel):
     user_id: int = Field(description="User ID")
     portfolio_size: Optional[int] = Field(
@@ -77,6 +96,14 @@ class PortfolioRecommendationRequest(BaseModel):
         ge=1,
         le=20,
         description="추천 종목 개수(1~20). 채팅에서 '10개 종목 추천'처럼 요청하면 이 값이 전달됩니다.",
+    )
+    include_web_search: Optional[bool] = Field(
+        default=None,
+        description="(선택) 웹검색 기반 신호를 포함할지 여부. 미지정 시 서버 환경변수 기본값을 따릅니다.",
+    )
+    risk_free_rate: float = Field(
+        default=0.03,
+        description="(선택) 무위험 이자율(연율, 기본 3%). Agents 기반 최적화에서 사용됩니다.",
     )
 
 
@@ -103,31 +130,46 @@ async def recommend_portfolio(body: PortfolioRecommendationRequest):
         investor_type = survey_answer_to_investor_type(survey_answer)
 
         # 3) 포트폴리오 추천 생성
-        tool = PortfolioAnalysisTool()
-        lf_cfg = build_langfuse_runnable_config(
-            run_name="portfolio_recommendations",
-            trace_id=job_id,
-            user_id=body.user_id,
-            session_id=str(body.user_id),
-            tags=[
-                "stockelper-portfolio",
-                "api",
-                "portfolio",
-                "recommendations",
-            ],
-            metadata={
-                "endpoint": "/portfolio/recommendations",
-                "rec_id": rec_id,
-                "job_id": job_id,
-                "investor_type": investor_type,
-            },
-        )
-        cfg = {"configurable": {"user_id": body.user_id}}
-        cfg.update(lf_cfg)
-        result = await tool.ainvoke(
-            {"user_investor_type": investor_type, "portfolio_size": body.portfolio_size},
-            config=cfg,
-        )
+        if _use_openai_agents_for_recommendations():
+            manager = _get_agents_manager()
+            result = await manager.recommend_markdown(
+                engine=engine,
+                user_id=body.user_id,
+                investor_type=investor_type,
+                portfolio_size=body.portfolio_size,
+                request_id=job_id,
+                include_web_search=body.include_web_search,
+                risk_free_rate=body.risk_free_rate,
+            )
+        else:
+            tool = PortfolioAnalysisTool()
+            lf_cfg = build_langfuse_runnable_config(
+                run_name="portfolio_recommendations",
+                trace_id=job_id,
+                user_id=body.user_id,
+                session_id=str(body.user_id),
+                tags=[
+                    "stockelper-portfolio",
+                    "api",
+                    "portfolio",
+                    "recommendations",
+                ],
+                metadata={
+                    "endpoint": "/portfolio/recommendations",
+                    "rec_id": rec_id,
+                    "job_id": job_id,
+                    "investor_type": investor_type,
+                },
+            )
+            cfg = {"configurable": {"user_id": body.user_id}}
+            cfg.update(lf_cfg)
+            result = await tool.ainvoke(
+                {
+                    "user_investor_type": investor_type,
+                    "portfolio_size": body.portfolio_size,
+                },
+                config=cfg,
+            )
 
         # 4) 결과 생성 완료 후, 최초 레코드를 업데이트
         await update_portfolio_recommendation_job(rec_id, investor_type, result)
