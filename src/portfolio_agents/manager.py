@@ -711,12 +711,21 @@ class PortfolioAgentsManager:
         universe_target = min(max(int(target_portfolio_size) * 2, 10), int(self._analysis_top_n))
         fetch_n = min(int(self._analysis_top_n) * 2, 60)  # ETF/ETN 필터링을 고려해 여유 있게 호출
 
-        market_cap = await get_market_cap_rank(
-            top_n=fetch_n,
-            app_key=str(user_info.get("kis_app_key", "") or ""),
-            app_secret=str(user_info.get("kis_app_secret", "") or ""),
-            access_token=str(user_info.get("kis_access_token", "") or ""),
-        )
+        try:
+            market_cap = await get_market_cap_rank(
+                top_n=fetch_n,
+                app_key=str(user_info.get("kis_app_key", "") or ""),
+                app_secret=str(user_info.get("kis_app_secret", "") or ""),
+                access_token=str(user_info.get("kis_access_token", "") or ""),
+            )
+        except ValueError as e:
+            # KIS rate limit(초당 거래건수 초과) 시에는 전체 추천을 죽이지 않고,
+            # 보유 종목 기반으로만 후보군을 구성해 폴백합니다.
+            msg = str(e)
+            if "초당" in msg and "초과" in msg:
+                market_cap = []
+            else:
+                raise
         filtered = [x for x in market_cap if not _is_etf_or_etn(str(x.get("name", "") or ""))]
         filtered = filtered[:universe_target]
 
