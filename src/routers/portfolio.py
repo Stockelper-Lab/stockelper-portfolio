@@ -125,7 +125,16 @@ async def recommend_portfolio(body: PortfolioRecommendationRequest):
             )
         except Exception:
             pass
-        raise
+        # 클라이언트가 원인을 알 수 있도록 500 대신 의미있는 상태코드로 변환합니다.
+        if isinstance(e, HTTPException):
+            raise
+
+        msg = str(e)
+        if ("KIS 자격증명" in msg) or ("유효하지 않은 AppKey" in msg) or ("EGW00103" in msg):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg) from e
+        if ("초당" in msg and "초과" in msg) or ("EGW00133" in msg) or ("EGW00201" in msg):
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=msg) from e
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=msg) from e
 
     return {"id": rec_id, "job_id": job_id, "investor_type": investor_type, "result": result}
 

@@ -479,9 +479,20 @@ async def ensure_user_kis_access_token(
     validate: bool = True,
 ) -> str:
     """DB 저장 토큰 재사용 + 만료/무효 시 재발급 후 DB 업데이트."""
+    app_key = str((user_info or {}).get("kis_app_key", "") or "").strip()
+    app_secret = str((user_info or {}).get("kis_app_secret", "") or "").strip()
+
+    # user_id별 KIS 자격증명은 DB(users)에서 가져오며,
+    # 값이 비정상(placeholder/너무 짧음)이면 KIS 호출 전에 명확히 실패시킵니다.
+    if len(app_key) < 10 or len(app_secret) < 10:
+        raise ValueError(
+            f"user_id={user_id}의 KIS 자격증명(kis_app_key/kis_app_secret)이 유효하지 않습니다. "
+            "stockelper_web.users 값을 확인하세요."
+        )
+
     token = str((user_info or {}).get("kis_access_token", "") or "").strip()
     if not token:
-        token = await get_access_token(user_info["kis_app_key"], user_info["kis_app_secret"])
+        token = await get_access_token(app_key, app_secret)
         if not token:
             raise ValueError("KIS access token 발급 실패 (app_key/app_secret 확인 필요)")
         await update_user_kis_credentials(async_engine, user_id, token)
@@ -489,13 +500,13 @@ async def ensure_user_kis_access_token(
 
     if validate:
         ok, _reason = await validate_kis_access_token(
-            user_info["kis_app_key"],
-            user_info["kis_app_secret"],
+            app_key,
+            app_secret,
             token,
             base_url=_get_kis_api_base_url(),
         )
         if not ok:
-            token = await get_access_token(user_info["kis_app_key"], user_info["kis_app_secret"])
+            token = await get_access_token(app_key, app_secret)
             if not token:
                 raise ValueError("만료된 KIS 토큰 재발급 실패 (rate limit/키/네트워크 확인 필요)")
             await update_user_kis_credentials(async_engine, user_id, token)
