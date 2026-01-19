@@ -64,7 +64,10 @@ class PortfolioBuilder:
         returns_matrix = np.array([data.returns for data in market_data_list])
 
         # 공분산 행렬 계산 (일별 -> 연율화: 252 거래일 가정)
-        cov_matrix = np.cov(returns_matrix) * 252
+        # NOTE:
+        # - 종목이 1개면 np.cov가 스칼라(0-d)로 반환되어 이후 matmul이 깨질 수 있으므로,
+        #   항상 2D 행렬이 되도록 보정합니다.
+        cov_matrix = np.atleast_2d(np.cov(returns_matrix)) * 252
 
         return cov_matrix, n_stocks
 

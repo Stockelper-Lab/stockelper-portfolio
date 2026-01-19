@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import aiohttp
+import random
+import time
 from agents import Runner, RunConfig, custom_span, trace
 
 from multi_agent.utils import ensure_user_kis_access_token, get_user_kis_credentials
@@ -115,10 +117,11 @@ class PortfolioAgentsManager:
     """
 
     def __init__(self) -> None:
-        self._enable_web_search = _bool_env("PORTFOLIO_ENABLE_WEBSEARCH", default=False)
+        # 디폴트: 모든 LLM 에이전트(검색/뷰/리포트/검증) 활성화
+        self._enable_web_search = _bool_env("PORTFOLIO_ENABLE_WEBSEARCH", default=True)
         self._enable_llm_views = _bool_env("PORTFOLIO_ENABLE_LLM_VIEWS", default=True)
         self._enable_llm_report = _bool_env("PORTFOLIO_ENABLE_LLM_REPORT", default=True)
-        self._enable_llm_verify = _bool_env("PORTFOLIO_ENABLE_LLM_VERIFY", default=False)
+        self._enable_llm_verify = _bool_env("PORTFOLIO_ENABLE_LLM_VERIFY", default=True)
 
         self._analysis_top_n = _safe_int(os.getenv("PORTFOLIO_ANALYSIS_TOP_N", "20"), 20)
         self._default_portfolio_size = _safe_int(
@@ -126,6 +129,12 @@ class PortfolioAgentsManager:
         )
         self._websearch_max = _safe_int(os.getenv("PORTFOLIO_WEBSEARCH_MAX_STOCKS", "6"), 6)
         self._view_max = _safe_int(os.getenv("PORTFOLIO_VIEW_MAX_STOCKS", "10"), 10)
+
+        # KIS inquire-price(업종/시장) 조회는 초당 제한에 민감하므로,
+        # 프로세스 내에서 직렬화 + 최소 간격 + 캐시를 둡니다.
+        self._quote_lock = asyncio.Lock()
+        self._quote_next_allowed_at = 0.0  # monotonic seconds
+        self._sector_market_cache: dict[str, tuple[str, str]] = {}
 
     @staticmethod
     def _llm_available() -> bool:
@@ -916,13 +925,15 @@ class PortfolioAgentsManager:
         try:
             r = await Runner.run(view_agent, prompt, run_config=run_cfg)
             data = r.final_output_as(InvestorViewResponse)
+            # 마크다운 테이블 셀에서 줄바꿈/파이프(|)가 있으면 렌더링이 깨질 수 있어 사전 정리합니다.
+            reasoning = str(data.reasoning or "").replace("\r", "").replace("\n", " ").replace("|", "\\|")
             return (
                 idx,
                 InvestorView(
                     stock_indices=[idx],
                     expected_return=float(data.expected_return),
                     confidence=float(data.confidence),
-                    reasoning=str(data.reasoning or ""),
+                    reasoning=reasoning,
                 ),
             )
         except Exception:
@@ -1080,14 +1091,62 @@ class PortfolioAgentsManager:
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            # rps: 분석/리포트 경로는 보통 모의투자에서 1~2 권장
+            rps_raw = (os.getenv("KIS_ANALYSIS_MAX_REQUESTS_PER_SECOND") or os.getenv("KIS_MAX_REQUESTS_PER_SECOND") or "1").strip()
+            try:
+                rps = float(rps_raw)
+                if rps <= 0:
+                    rps = 1.0
+            except Exception:
+                rps = 1.0
+            min_interval = 1.0 / float(rps)
+
+            def now() -> float:
+                return time.monotonic()
+
+            async def sleep_for_rate_limit():
+                async with self._quote_lock:
+                    t = now()
+                    if t < self._quote_next_allowed_at:
+                        await asyncio.sleep(self._quote_next_allowed_at - t)
+                    self._quote_next_allowed_at = max(self._quote_next_allowed_at, now()) + min_interval
+
             for sym in symbols:
                 sym = str(sym or "").strip()
                 if not sym:
                     continue
+
+                # 캐시 우선
+                cached = self._sector_market_cache.get(sym)
+                if cached:
+                    sector, market = cached
+                    if sector:
+                        code_to_sector[sym] = sector
+                    if market:
+                        code_to_market[sym] = market
+                    continue
+
                 params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": sym}
-                async with session.get(url, headers=headers, params=params) as res:
-                    data = await res.json(content_type=None)
-                if str(data.get("rt_cd", "")).strip() != "0":
+                # 레이트리밋(초당 거래건수 초과/EGW00201) 시 백오프 재시도
+                data = {}
+                for attempt in range(0, 3):
+                    await sleep_for_rate_limit()
+                    async with session.get(url, headers=headers, params=params) as res:
+                        data = await res.json(content_type=None)
+
+                    if str(data.get("rt_cd", "")).strip() == "0":
+                        break
+
+                    msg_cd = str(data.get("msg_cd", "") or "")
+                    msg1 = str(data.get("msg1", "") or "")
+                    is_rl = (msg_cd in {"EGW00201", "EGW00133"}) or ("초당" in msg1 and "초과" in msg1) or ("거래건수" in msg1 and "초과" in msg1)
+                    if not is_rl:
+                        break
+                    # backoff
+                    delay = max(min_interval, 0.2) * (2**attempt) + random.uniform(0.0, 0.2)
+                    await asyncio.sleep(delay)
+
+                if str((data or {}).get("rt_cd", "")).strip() != "0":
                     continue
                 output = (data.get("output") or {}) or {}
                 if isinstance(output, list):
@@ -1100,8 +1159,8 @@ class PortfolioAgentsManager:
                     code_to_sector[sym] = sector
                 if market:
                     code_to_market[sym] = market
-                # 과도한 burst 방지(소량 호출이므로 짧게)
-                await asyncio.sleep(0.05)
+                # 캐시 저장(업종/시장은 자주 바뀌지 않음)
+                self._sector_market_cache[sym] = (sector, market)
 
         return code_to_sector, code_to_market
 
@@ -1195,14 +1254,27 @@ class PortfolioAgentsManager:
         lines.append("## 3) 최종 추천 포트폴리오")
         lines.append("| 순위 | 구분 | 종목명 | 종목코드 | 업종 | 시장 | 투자비중 | 근거 |")
         lines.append("|---:|---|---|---:|---|---|---:|---|")
+
+        def md_cell(x: Any) -> str:
+            """마크다운 테이블 셀 안전화.
+
+            - 줄바꿈은 <br>로 치환 (테이블 깨짐 방지)
+            - 파이프(|)는 이스케이프
+            """
+            t = str(x or "")
+            t = t.replace("\r", "")
+            t = t.replace("|", "\\|")
+            t = t.replace("\n", "<br>")
+            return t.strip()
+
         for i, w in enumerate(recommended, start=1):
             kind = "기보유" if w.code in holding_codes else "신규"
-            sector = code_to_sector.get(w.code, "N/A")
-            market = code_to_market.get(w.code, "N/A")
+            sector = md_cell(code_to_sector.get(w.code, "N/A"))
+            market = md_cell(code_to_market.get(w.code, "N/A"))
             pct = float(w.weight) * 100.0
-            reasoning = str(getattr(w, "reasoning", "") or "")
+            reasoning = md_cell(getattr(w, "reasoning", "") or "")
             lines.append(
-                f"| {i} | {kind} | {w.name} | {w.code} | {sector} | {market} | {pct:.2f}% | {reasoning} |"
+                f"| {i} | {md_cell(kind)} | {md_cell(w.name)} | {md_cell(w.code)} | {sector} | {market} | {pct:.2f}% | {reasoning} |"
             )
         lines.append("")
 
