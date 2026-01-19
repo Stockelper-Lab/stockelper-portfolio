@@ -1,11 +1,11 @@
 # Stockelper Portfolio Service
 
-LangGraph 기반 포트폴리오 추천 및 자동 매매 서비스입니다.
+OpenAI Agents SDK 기반 포트폴리오 추천 및 자동 매매 서비스입니다.
 
 ## 🚀 주요 기능
 
 - 투자 성향 기반 포트폴리오 추천
-- LangGraph 다중 에이전트 매수/매도 워크플로우
+- OpenAI Agents SDK 기반 매수/매도 워크플로우
 - Black-Litterman 모델 기반 포트폴리오 최적화
 - 한국투자증권 (KIS) API 연동 실제 거래
 - 다중 지표 종목 랭킹 시스템
@@ -14,10 +14,9 @@ LangGraph 기반 포트폴리오 추천 및 자동 매매 서비스입니다.
 
 - Python 3.12+
 - FastAPI 0.111
-- LangGraph (상태 그래프 기반 워크플로우)
-- LangChain 1.0+
+- OpenAI Agents SDK (`openai-agents`)
 - PostgreSQL (asyncpg, psycopg)
-- OpenRouter API (Perplexity, GPT-4.5.1)
+- OpenAI API
 - Korea Investment & Securities (KIS) API
 - OpenDartReader (한국 금융감독원 DART)
 
@@ -29,42 +28,8 @@ LangGraph 기반 포트폴리오 추천 및 자동 매매 서비스입니다.
 
 ### 포트폴리오
 - `POST /portfolio/recommendations` - 투자 성향 기반 추천
-- `POST /portfolio/buy` - 매수 워크플로우 (LangGraph)
-- `POST /portfolio/sell` - 매도 워크플로우 (LangGraph)
-
-## 🤖 LangGraph 워크플로우
-
-### 매수 워크플로우
-
-```
-Ranking (11개 지표 기반)
-  ↓
-Analysis (병렬 3개)
-  ├─ WebSearch (Perplexity)
-  ├─ FinancialStatement (재무제표)
-  └─ TechnicalIndicator (기술적 지표)
-  ↓
-ViewGenerator (Black-Litterman 뷰 생성)
-  ↓
-PortfolioBuilder (포트폴리오 최적화)
-  ↓
-PortfolioTrader (매수 주문 실행)
-```
-
-### 매도 워크플로우
-
-```
-GetPortfolioHoldings (보유 종목 조회)
-  ↓
-Analysis (병렬 3개)
-  ├─ WebSearch
-  ├─ FinancialStatement
-  └─ TechnicalIndicator
-  ↓
-SellDecisionMaker (매도 결정)
-  ↓
-PortfolioSeller (매도 주문 실행)
-```
+- `POST /portfolio/buy` - 매수 워크플로우 (OpenAI Agents SDK)
+- `POST /portfolio/sell` - 매도 워크플로우 (OpenAI Agents SDK)
 
 ## 📊 종목 랭킹 시스템
 
@@ -104,10 +69,14 @@ ASYNC_DATABASE_URL_KSIC=postgresql+asyncpg://user:pass@host:5432/ksic  # 선택(
 #   예) OPEN_DART_API_KEYS=key1,key2,key3
 OPEN_DART_API_KEY=
 OPEN_DART_API_KEYS=
-OPENROUTER_API_KEY=
+
+# OpenAI Agents SDK
+OPENAI_API_KEY=
+# OPENAI_AGENTS_DISABLE_TRACING=1  # (선택) Agents SDK 트레이싱 비활성화
 
 # (옵션) Langfuse 트레이싱
-# - 설정 시 /portfolio/* 요청의 LangChain/LangGraph 실행이 Langfuse로 트레이싱됩니다.
+# - 본 레포는 기본적으로 OpenAI Agents SDK tracing을 사용합니다.
+# - Langfuse 설정은 남겨두되, LangChain/LangGraph 기반 경로 제거로 현재 API에서는 기본 미사용입니다.
 # - 가이드: [Langfuse Get Started](https://langfuse.com/docs/observability/get-started)
 LANGFUSE_SECRET_KEY=
 LANGFUSE_PUBLIC_KEY=

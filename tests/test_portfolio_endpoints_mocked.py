@@ -7,12 +7,13 @@ import routers.portfolio as portfolio_router
 
 
 def test_portfolio_recommendations_mocked(monkeypatch):
-    async def fake_ainvoke(self, input, config=None):  # noqa: ANN001
-        return "MOCK_RECOMMENDATION_RESULT"
+    class DummyManager:
+        async def recommend_markdown(self, **kwargs):  # noqa: ANN001
+            return "MOCK_RECOMMENDATION_RESULT"
 
-    # DB/외부 API 없이도 라우터의 request/response 형태를 검증하기 위해 모킹
+    # DB/외부 API/LLM 없이도 라우터의 request/response 형태를 검증하기 위해 모킹
     monkeypatch.setattr(
-        portfolio_router.PortfolioAnalysisTool, "ainvoke", fake_ainvoke, raising=True
+        portfolio_router, "_get_agents_manager", lambda: DummyManager(), raising=True
     )
     monkeypatch.setattr(portfolio_router, "_get_engine", lambda: object(), raising=True)
     async def fake_get_user_survey_answer(engine, user_id):  # noqa: ANN001
@@ -72,32 +73,36 @@ def test_portfolio_recommendations_mocked(monkeypatch):
 
 
 def test_portfolio_buy_mocked(monkeypatch):
-    class DummyWorkflow:
-        async def ainvoke(self, payload, config=None):  # noqa: ANN001
-            return {"ok": True, "input": payload}
+    class DummyManager:
+        async def buy(self, **kwargs):  # noqa: ANN001
+            return {"ok": True}
 
-    monkeypatch.setattr(portfolio_router, "_get_buy_workflow", lambda: DummyWorkflow())
+    monkeypatch.setattr(
+        portfolio_router, "_get_agents_manager", lambda: DummyManager(), raising=True
+    )
+    monkeypatch.setattr(portfolio_router, "_get_engine", lambda: object(), raising=True)
 
     client = TestClient(app)
     res = client.post("/portfolio/buy", json={"user_id": 1})
     assert res.status_code == 200
     payload = res.json()
     assert payload["ok"] is True
-    assert "input" in payload
 
 
 def test_portfolio_sell_mocked(monkeypatch):
-    class DummyWorkflow:
-        async def ainvoke(self, payload, config=None):  # noqa: ANN001
-            return {"ok": True, "input": payload}
+    class DummyManager:
+        async def sell(self, **kwargs):  # noqa: ANN001
+            return {"ok": True}
 
-    monkeypatch.setattr(portfolio_router, "_get_sell_workflow", lambda: DummyWorkflow())
+    monkeypatch.setattr(
+        portfolio_router, "_get_agents_manager", lambda: DummyManager(), raising=True
+    )
+    monkeypatch.setattr(portfolio_router, "_get_engine", lambda: object(), raising=True)
 
     client = TestClient(app)
     res = client.post("/portfolio/sell", json={"user_id": 1})
     assert res.status_code == 200
     payload = res.json()
     assert payload["ok"] is True
-    assert "input" in payload
 
 

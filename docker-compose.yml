@@ -21,7 +21,8 @@ services:
 
       # External APIs / Keys (필요한 엔드포인트에서만 사용)
       OPEN_DART_API_KEY: ${OPEN_DART_API_KEY:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_AGENTS_DISABLE_TRACING: ${OPENAI_AGENTS_DISABLE_TRACING:-}
 
       # (선택) schema 명이 stockelper_web가 아니라면 지정
       STOCKELPER_WEB_SCHEMA: ${STOCKELPER_WEB_SCHEMA:-public}

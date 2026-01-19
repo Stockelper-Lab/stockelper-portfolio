@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -38,4 +38,11 @@ class VerificationResult(BaseModel):
     retry_suggestion: Optional[str] = Field(
         default=None, description="재시도/수정이 필요하면 제안"
     )
+
+
+class SellDecisionResponse(BaseModel):
+    """단일 종목에 대한 매도 결정(LLM 출력)."""
+
+    decision: Literal["SELL", "HOLD"] = Field(description="매도 결정(SELL/HOLD)")
+    reasoning: str = Field(description="결정 사유(2~3문장, 간결)")
 

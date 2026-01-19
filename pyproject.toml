@@ -1,7 +1,7 @@
 [project]
 name = "stockelper-portfolio"
 version = "0.1.0"
-description = "Stockelper Portfolio Service (FastAPI + LangGraph/LangChain)"
+description = "Stockelper Portfolio Service (FastAPI + OpenAI Agents SDK)"
 # readme = "README.md"  # Optional for Docker builds
 requires-python = ">=3.12"
 dependencies = [
@@ -18,11 +18,7 @@ dependencies = [
     "asyncpg",
     "psycopg[binary]==3.2.*",
     "sqlalchemy>=2.0",
-    "langchain>=1.0.0",
-    "langgraph",
     "langfuse",
-    "langgraph-checkpoint-postgres",
-    "langchain-openai",
     "pymongo",
     "motor",
     "youtube-transcript-api",
@@ -37,9 +33,6 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
-    "langchain>=1.0.0",
-    "langgraph",
-    "langchain-openai",
     "langfuse",
     "pymongo",
     "lancedb",
@@ -48,7 +41,6 @@ ml = [
     "motor",
     "youtube-transcript-api",
     "google-api-python-client",
-    "langgraph-checkpoint-postgres",
 ]
 dev = [
     "pytest",

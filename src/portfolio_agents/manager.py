@@ -10,10 +10,20 @@ import aiohttp
 from agents import Runner, RunConfig, custom_span, trace
 
 from multi_agent.utils import ensure_user_kis_access_token, get_user_kis_credentials
+from portfolio_multi_agent.nodes.portfolio_seller import (
+    InputState as PortfolioSellerInputState,
+    PortfolioSeller,
+)
+from portfolio_multi_agent.nodes.portfolio_trader import (
+    InputState as PortfolioTraderInputState,
+    PortfolioTrader,
+)
+from portfolio_multi_agent.nodes.ranking import InputState as RankingInputState, Ranking
 from portfolio_multi_agent.nodes.get_financial_statement import (
     FinancialStatement,
     InputState as FinancialStatementInputState,
 )
+from portfolio_multi_agent.state import HoldingStock, RankWeight, SellDecision
 from portfolio_multi_agent.nodes.get_technical_indicator import (
     TechnicalIndicator,
     InputState as TechnicalIndicatorInputState,
@@ -32,9 +42,14 @@ from portfolio_multi_agent.state import (
     Stock,
 )
 
-from .agents import search_agent, verifier_agent, view_agent, writer_agent
+from .agents import search_agent, sell_agent, verifier_agent, view_agent, writer_agent
 from .context import PortfolioAgentContext
-from .schemas import InvestorViewResponse, PortfolioReportData, VerificationResult
+from .schemas import (
+    InvestorViewResponse,
+    PortfolioReportData,
+    SellDecisionResponse,
+    VerificationResult,
+)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -282,6 +297,331 @@ class PortfolioAgentsManager:
             group_id=getattr(run_cfg, "group_id", None) or None,
         ):
             return await run_pipeline()
+
+    async def buy(
+        self,
+        *,
+        engine: Any,
+        user_id: int,
+        request_id: str,
+        max_portfolio_size: int = 10,
+        rank_weight: RankWeight | None = None,
+        risk_free_rate: float = 0.03,
+    ) -> dict[str, Any]:
+        """매수 워크플로우(Agents SDK 기반).
+
+        - LangGraph 없이, 코드 기반 오케스트레이션 + Agents(Structured Outputs)로 구현합니다.
+        - 반환 형태는 기존 `/portfolio/buy` 응답과 유사하게 유지합니다.
+        """
+        now_utc = datetime.now(timezone.utc)
+        ctx = PortfolioAgentContext(
+            user_id=user_id,
+            engine=engine,
+            request_id=request_id,
+            now_utc=now_utc,
+            kis_base_url=_kis_base_url(),
+            include_web_search=self._enable_web_search,
+            risk_free_rate=float(risk_free_rate),
+        )
+        run_cfg = self._build_run_config(ctx)
+
+        def span(name: str):
+            return custom_span(name) if not run_cfg.tracing_disabled else nullcontext()
+
+        async def run_pipeline() -> dict[str, Any]:
+            # 1) 사용자 자격증명/토큰
+            with span("Load user context"):
+                user_info = await get_user_kis_credentials(engine, user_id)
+                if not user_info:
+                    raise ValueError(f"user_id={user_id} 사용자를 DB에서 찾지 못했습니다.")
+                if not user_info.get("account_no"):
+                    raise ValueError("user.account_no가 비어있습니다.")
+
+                token = await ensure_user_kis_access_token(engine, user_id, user_info, validate=True)
+                user_info["kis_access_token"] = token
+
+            # 2) 랭킹으로 후보 종목 선정
+            with span("Ranking"):
+                ranking = Ranking()
+                rw = rank_weight if rank_weight is not None else RankWeight()
+                out = await ranking(
+                    RankingInputState(
+                        user_id=user_id,
+                        kis_app_key=user_info.get("kis_app_key"),
+                        kis_app_secret=user_info.get("kis_app_secret"),
+                        kis_access_token=user_info.get("kis_access_token"),
+                        account_no=user_info.get("account_no"),
+                        max_portfolio_size=int(max_portfolio_size or self._default_portfolio_size),
+                        rank_weight=rw,
+                    )
+                )
+                universe: list[Stock] = list(out.get("portfolio_list") or [])
+                stock_scores: dict[str, float] = dict(out.get("stock_scores") or {})
+
+            # 3) 신호 수집(재무/기술 + 선택: 웹검색)
+            with span("Collect signals"):
+                analysis_results, market_data_list = await self._collect_signals(
+                    ctx=ctx, user_info=user_info, universe=universe, run_cfg=run_cfg
+                )
+
+            # 4) Investor views(LLM, 선택)
+            with span("Generate investor views"):
+                investor_views = await self._generate_investor_views(
+                    ctx=ctx,
+                    universe=universe,
+                    analysis_results=analysis_results,
+                    run_cfg=run_cfg,
+                )
+
+            # 5) 최적화(결정적)
+            with span("Optimize portfolio"):
+                portfolio_result = await self._build_portfolio(
+                    universe=universe,
+                    stock_scores=stock_scores,
+                    market_data_list=market_data_list,
+                    investor_views=investor_views,
+                    risk_free_rate=float(ctx.risk_free_rate),
+                )
+
+            # 6) 주문 실행(결정적)
+            with span("Place buy orders"):
+                trader = PortfolioTrader()
+                trade_out = await trader(
+                    PortfolioTraderInputState(
+                        user_id=user_id,
+                        kis_app_key=user_info.get("kis_app_key"),
+                        kis_app_secret=user_info.get("kis_app_secret"),
+                        kis_access_token=user_info.get("kis_access_token"),
+                        account_no=user_info.get("account_no"),
+                        portfolio_result=portfolio_result,
+                    )
+                )
+                trading_result = trade_out.get("trading_result")
+
+            return {
+                "analysis_results": analysis_results,
+                "portfolio_result": portfolio_result,
+                "trading_result": trading_result,
+            }
+
+        if run_cfg.tracing_disabled:
+            return await run_pipeline()
+
+        with trace(
+            "Stockelper Portfolio Buy Agent",
+            trace_id=getattr(run_cfg, "trace_id", None) or None,
+            group_id=getattr(run_cfg, "group_id", None) or None,
+        ):
+            return await run_pipeline()
+
+    async def sell(
+        self,
+        *,
+        engine: Any,
+        user_id: int,
+        request_id: str,
+        loss_threshold: float = -0.10,
+        profit_threshold: float = 0.20,
+    ) -> dict[str, Any]:
+        """매도 워크플로우(Agents SDK 기반)."""
+        now_utc = datetime.now(timezone.utc)
+        ctx = PortfolioAgentContext(
+            user_id=user_id,
+            engine=engine,
+            request_id=request_id,
+            now_utc=now_utc,
+            kis_base_url=_kis_base_url(),
+            include_web_search=self._enable_web_search,
+            risk_free_rate=0.03,
+        )
+        run_cfg = self._build_run_config(ctx)
+
+        def span(name: str):
+            return custom_span(name) if not run_cfg.tracing_disabled else nullcontext()
+
+        async def run_pipeline() -> dict[str, Any]:
+            # 1) 사용자 자격증명/토큰
+            with span("Load user context"):
+                user_info = await get_user_kis_credentials(engine, user_id)
+                if not user_info:
+                    raise ValueError(f"user_id={user_id} 사용자를 DB에서 찾지 못했습니다.")
+                if not user_info.get("account_no"):
+                    raise ValueError("user.account_no가 비어있습니다.")
+
+                token = await ensure_user_kis_access_token(engine, user_id, user_info, validate=True)
+                user_info["kis_access_token"] = token
+
+            # 2) 보유 종목 조회(KIS)
+            with span("Fetch holdings"):
+                holdings, _summary, holdings_error = await self._fetch_holdings(user_info, ctx)
+                holding_stocks: list[HoldingStock] = []
+                for h in holdings:
+                    try:
+                        holding_stocks.append(HoldingStock(**h))
+                    except Exception:
+                        continue
+
+            # 3) 신호 수집(재무/기술 + 선택: 웹검색)
+            universe = [Stock(code=h.code, name=h.name) for h in holding_stocks]
+            with span("Collect signals"):
+                analysis_results, _market_data_list = await self._collect_signals(
+                    ctx=ctx, user_info=user_info, universe=universe, run_cfg=run_cfg
+                )
+
+            # 4) 매도 결정(LLM, 선택; 미사용/불가 시 임계치 기반 폴백)
+            with span("Decide sells"):
+                sell_decisions = await self._decide_sell(
+                    holding_stocks=holding_stocks,
+                    analysis_results=analysis_results,
+                    run_cfg=run_cfg,
+                    loss_threshold=float(loss_threshold),
+                    profit_threshold=float(profit_threshold),
+                )
+
+            # 5) 매도 주문 실행(결정적)
+            with span("Place sell orders"):
+                seller = PortfolioSeller()
+                out = await seller(
+                    PortfolioSellerInputState(
+                        user_id=user_id,
+                        kis_app_key=user_info.get("kis_app_key"),
+                        kis_app_secret=user_info.get("kis_app_secret"),
+                        kis_access_token=user_info.get("kis_access_token"),
+                        account_no=user_info.get("account_no"),
+                        holding_stocks=holding_stocks,
+                        sell_decisions=sell_decisions,
+                    )
+                )
+                sell_result = out.get("sell_result")
+
+            return {
+                "holding_stocks": holding_stocks,
+                "analysis_results": analysis_results,
+                "sell_decisions": sell_decisions,
+                "sell_result": sell_result,
+            }
+
+        if run_cfg.tracing_disabled:
+            return await run_pipeline()
+
+        with trace(
+            "Stockelper Portfolio Sell Agent",
+            trace_id=getattr(run_cfg, "trace_id", None) or None,
+            group_id=getattr(run_cfg, "group_id", None) or None,
+        ):
+            return await run_pipeline()
+
+    async def _decide_sell(
+        self,
+        *,
+        holding_stocks: list[HoldingStock],
+        analysis_results: list[AnalysisResult],
+        run_cfg: RunConfig,
+        loss_threshold: float,
+        profit_threshold: float,
+    ) -> list[SellDecision]:
+        """보유 종목별 매도 여부를 결정합니다."""
+        if not holding_stocks:
+            return []
+
+        # 종목별 분석 결과 그룹화
+        grouped: dict[str, dict[str, str]] = {}
+        for h in holding_stocks:
+            grouped[h.code] = {
+                "web_search": "",
+                "financial_statement": "",
+                "technical_indicator": "",
+            }
+        for r in analysis_results:
+            if r.code not in grouped:
+                continue
+            grouped[r.code][r.type] = r.result or ""
+
+        # LLM 불가: 임계치 기반 결정(폴백)
+        if not self._llm_available():
+            out: list[SellDecision] = []
+            for h in holding_stocks:
+                rr = float(getattr(h, "return_rate", 0.0) or 0.0)
+                if rr <= loss_threshold:
+                    out.append(
+                        SellDecision(
+                            code=h.code,
+                            name=h.name,
+                            reasoning=f"손절 기준({loss_threshold*100:.1f}%) 이하({rr*100:.1f}%)로 판단되어 매도합니다.",
+                        )
+                    )
+                elif rr >= profit_threshold:
+                    out.append(
+                        SellDecision(
+                            code=h.code,
+                            name=h.name,
+                            reasoning=f"익절 기준({profit_threshold*100:.1f}%) 이상({rr*100:.1f}%)으로 판단되어 매도합니다.",
+                        )
+                    )
+            return out
+
+        max_targets = _safe_int(os.getenv("PORTFOLIO_SELL_MAX_STOCKS", "30"), 30)
+        targets = holding_stocks[: max(1, int(max_targets))]
+
+        tasks: list[asyncio.Task] = []
+        for h in targets:
+            analyses = grouped.get(h.code, {})
+            tasks.append(
+                asyncio.create_task(
+                    self._sell_one(
+                        holding=h,
+                        analyses=analyses,
+                        run_cfg=run_cfg,
+                        loss_threshold=loss_threshold,
+                        profit_threshold=profit_threshold,
+                    )
+                )
+            )
+
+        decisions: list[SellDecision] = []
+        for t in asyncio.as_completed(tasks):
+            d = await t
+            if d is not None:
+                decisions.append(d)
+        return decisions
+
+    async def _sell_one(
+        self,
+        *,
+        holding: HoldingStock,
+        analyses: dict[str, str],
+        run_cfg: RunConfig,
+        loss_threshold: float,
+        profit_threshold: float,
+    ) -> SellDecision | None:
+        web = (analyses.get("web_search") or "").strip() or "N/A"
+        fin = (analyses.get("financial_statement") or "").strip() or "N/A"
+        tech = (analyses.get("technical_indicator") or "").strip() or "N/A"
+
+        rr = float(getattr(holding, "return_rate", 0.0) or 0.0) * 100.0
+        prompt = (
+            f"보유 종목 정보:\n"
+            f"- 종목명: {holding.name} ({holding.code})\n"
+            f"- 보유 수량: {holding.quantity}주\n"
+            f"- 평균 매입가: {holding.avg_buy_price}\n"
+            f"- 현재가: {holding.current_price}\n"
+            f"- 수익률: {rr:.2f}%\n"
+            f"- 손절 기준: {loss_threshold*100:.2f}%\n"
+            f"- 익절 기준: {profit_threshold*100:.2f}%\n\n"
+            f"분석 결과:\n"
+            f"1) 웹 검색: {web}\n\n"
+            f"2) 재무제표: {fin}\n\n"
+            f"3) 기술적 지표: {tech}\n"
+        )
+        try:
+            r = await Runner.run(sell_agent, prompt, run_config=run_cfg)
+            data = r.final_output_as(SellDecisionResponse)
+            decision = str(getattr(data, "decision", "HOLD") or "HOLD").strip().upper()
+            if decision != "SELL":
+                return None
+            return SellDecision(code=holding.code, name=holding.name, reasoning=str(data.reasoning or ""))
+        except Exception:
+            return None
 
     async def _fetch_holdings(
         self, user_info: dict, ctx: PortfolioAgentContext

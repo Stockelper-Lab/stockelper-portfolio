@@ -11,7 +11,6 @@ import aiohttp
 import asyncpg
 import requests
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from sqlalchemy import Column, Integer, Text, TIMESTAMP, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -647,14 +646,10 @@ def place_order(stock_code:str, order_side:str, order_type:str, order_price:floa
     
 
 def custom_add_messages(existing: list, update: list):
-    for message in update:
-        if not isinstance(message, BaseMessage):
-            if message["role"] == "user":
-                existing.append(HumanMessage(content=message["content"]))
-            elif message["role"] == "assistant":
-                existing.append(AIMessage(content=message["content"]))
-            else:
-                raise ValueError(f"Invalid message type: {type(message)}")
-        else:
-            existing.append(message)
+    """레거시 메시지 병합 유틸.
+
+    Agents-only 전환으로 LangChain 메시지 타입 의존을 제거했습니다.
+    현재 레포에서 사용되지 않지만, 외부 호출자가 있을 수 있어 최소 형태로 유지합니다.
+    """
+    existing.extend(list(update or []))
     return existing[-10:]
