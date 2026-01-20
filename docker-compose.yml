@@ -21,6 +21,8 @@ services:
 
       # External APIs / Keys (필요한 엔드포인트에서만 사용)
       OPEN_DART_API_KEY: ${OPEN_DART_API_KEY:-}
+      # 여러 개 설정 시 자동 로테이션(README 참고)
+      OPEN_DART_API_KEYS: ${OPEN_DART_API_KEYS:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_AGENTS_DISABLE_TRACING: ${OPENAI_AGENTS_DISABLE_TRACING:-}
 

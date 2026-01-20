@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import asyncio
 import logging
@@ -108,6 +110,20 @@ class FinancialStatement:
                     continue
 
             raise ValueError("OpenDartReader 초기화 실패: 사용 가능한 DART API Key가 없습니다.")
+
+    def _finstate_all_with_capture(self, dart, stock_code: str, year: int):
+        """`dart.finstate_all()` 호출 시 출력(표준출력/표준에러)을 캡처합니다.
+
+        OpenDartReader는 일부 오류(예: status=020)를 예외로 던지지 않고,
+        콘솔에 출력한 뒤 빈 DataFrame을 반환할 수 있습니다. 이를 감지해 키 로테이션에 활용합니다.
+
+        주의: OpenDartReader 인스턴스/표준출력은 스레드 세이프하지 않을 수 있어,
+        `_dart_lock`으로 호출을 직렬화합니다.
+        """
+        buf = io.StringIO()
+        with self._dart_lock, contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            df = dart.finstate_all(stock_code, year)
+        return df, buf.getvalue()
 
     async def __call__(self, state: InputState) -> OutputState:
         """
@@ -301,11 +317,30 @@ class FinancialStatement:
         for offset in range(5):
             year = current_year - offset
             try:
-                df = dart.finstate_all(stock.code, year)
-
+                df, out = self._finstate_all_with_capture(dart, stock.code, year)
                 if df is not None and not df.empty:
                     financial_statement_all = df
                     break
+
+                # OpenDartReader가 예외 대신 출력+빈 DF로 신호를 주는 케이스(status=020 등)
+                if is_dart_quota_exceeded_error(out):
+                    logger.warning(
+                        "DART finstate_all quota exceeded(status=020) for %s(%s); rotate key and retry once",
+                        stock.name,
+                        stock.code,
+                    )
+                    self._invalidate_current_key()
+                    try:
+                        dart = self._get_dart()
+                        df2, out2 = self._finstate_all_with_capture(dart, stock.code, year)
+                        if df2 is not None and not df2.empty:
+                            financial_statement_all = df2
+                            break
+                        if is_dart_quota_exceeded_error(out2):
+                            # 다음 호출에서 다른 키를 강제하도록 소진 마킹
+                            self._invalidate_current_key()
+                    except Exception:
+                        pass
 
             except Exception as e:
                 if is_dart_quota_exceeded_error(e):
@@ -317,10 +352,12 @@ class FinancialStatement:
                     self._invalidate_current_key()
                     try:
                         dart = self._get_dart()
-                        df = dart.finstate_all(stock.code, year)
-                        if df is not None and not df.empty:
-                            financial_statement_all = df
+                        df2, out2 = self._finstate_all_with_capture(dart, stock.code, year)
+                        if df2 is not None and not df2.empty:
+                            financial_statement_all = df2
                             break
+                        if is_dart_quota_exceeded_error(out2):
+                            self._invalidate_current_key()
                     except Exception:
                         pass
                 continue
