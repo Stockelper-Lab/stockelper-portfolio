@@ -975,27 +975,146 @@ class PortfolioAgentsManager:
         run_cfg: RunConfig,
         extra_instruction: str | None = None,
     ) -> str:
-        # 최종 추천 종목: weight desc 상위 N
-        recommended = list((portfolio_result.weights if portfolio_result else []) or [])
-        recommended = sorted(recommended, key=lambda w: w.weight, reverse=True)
-        recommended = recommended[: max(0, int(portfolio_size))]
+        # 목표 최종 종목 수: "보유 종목 + 신규 추천" 합이 이 값이 되도록 맞춥니다.
+        # (예: "20개까지 추천"이면, 현재 보유 종목 수를 포함해 최종 20개가 되도록 신규를 채움)
+        target_n = max(0, int(portfolio_size))
 
-        # 최적화 결과가 없거나 비어 있으면, 점수 기반 균등배분으로 폴백
-        if not recommended:
-            fallback = sorted(
-                universe, key=lambda s: float(stock_scores.get(s.code, 0.0)), reverse=True
-            )[: max(1, int(portfolio_size))]
-            if fallback:
-                w = 1.0 / float(len(fallback))
-                recommended = [
-                    PortfolioWeight(
-                        code=s.code,
-                        name=s.name,
-                        weight=w,
-                        reasoning="최적화 결과가 없어 점수 상위 종목을 균등 비중으로 구성했습니다.",
+        # 보유 종목 코드(중복 제거, 입력 순서 유지)
+        holding_list: list[dict] = list(holdings or [])
+        holding_codes_ordered: list[str] = []
+        seen_hold: set[str] = set()
+        for h in holding_list:
+            c = str(h.get("code", "") or "").strip()
+            if not c or c in seen_hold:
+                continue
+            seen_hold.add(c)
+            holding_codes_ordered.append(c)
+
+        # portfolio_result.weights(최적화 결과) → code 기준 맵
+        weights_all = list((portfolio_result.weights if portfolio_result else []) or [])
+        weights_all = sorted(weights_all, key=lambda w: float(w.weight), reverse=True)
+        weights_by_code: dict[str, PortfolioWeight] = {w.code: w for w in weights_all if w.code}
+        universe_by_code: dict[str, Stock] = {s.code: s for s in (universe or []) if s.code}
+
+        # 최종 추천 종목 코드 리스트 구성
+        final_codes: list[str] = []
+
+        # 1) 보유 종목이 target_n을 넘으면: 보유 종목 중에서 상위 target_n만 포함
+        if target_n > 0 and len(holding_codes_ordered) >= target_n:
+            # 보유 종목 정렬 기준: 평가금액(evaluated_amount) 우선, 없으면 최적화 weight, 없으면 0
+            code_to_eval: dict[str, float] = {}
+            for h in holding_list:
+                c = str(h.get("code", "") or "").strip()
+                if not c:
+                    continue
+                try:
+                    code_to_eval[c] = float(h.get("evaluated_amount", 0.0) or 0.0)
+                except Exception:
+                    code_to_eval[c] = 0.0
+
+            holding_codes_sorted = sorted(
+                holding_codes_ordered,
+                key=lambda c: (
+                    float(code_to_eval.get(c, 0.0)),
+                    float(getattr(weights_by_code.get(c), "weight", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
+            final_codes = holding_codes_sorted[:target_n]
+        else:
+            # 2) 보유 종목을 우선 포함
+            final_codes.extend(holding_codes_ordered)
+
+            # 3) 남는 슬롯만큼 신규 종목을 채움(최적화 weight 상위 → 부족하면 stock_scores 상위)
+            need = max(0, target_n - len(final_codes)) if target_n > 0 else 0
+            if need > 0:
+                # 3-1) 최적화 결과에서 보유 종목 제외 후 weight desc로 채움
+                for w in weights_all:
+                    if need <= 0:
+                        break
+                    c = str(getattr(w, "code", "") or "").strip()
+                    if not c or c in seen_hold or c in final_codes:
+                        continue
+                    final_codes.append(c)
+                    need -= 1
+
+            if need > 0:
+                # 3-2) 최적화 결과가 부족하면 score 상위로 채움
+                scored = sorted(
+                    (universe or []),
+                    key=lambda s: float(stock_scores.get(s.code, 0.0)),
+                    reverse=True,
+                )
+                for s in scored:
+                    if need <= 0:
+                        break
+                    c = str(s.code or "").strip()
+                    if not c or c in final_codes:
+                        continue
+                    final_codes.append(c)
+                    need -= 1
+
+        # 4) 최종 코드 리스트로 PortfolioWeight 리스트 생성
+        recommended: list[PortfolioWeight] = []
+        if target_n > 0 and final_codes:
+            # 최적화 결과가 있으면 해당 weight/근거를 우선 사용
+            for c in final_codes[:target_n]:
+                if c in weights_by_code:
+                    w = weights_by_code[c]
+                    recommended.append(
+                        PortfolioWeight(
+                            code=w.code,
+                            name=w.name,
+                            weight=float(w.weight),
+                            reasoning=str(getattr(w, "reasoning", "") or ""),
+                        )
                     )
-                    for s in fallback
-                ]
+                    continue
+
+                # 최적화 결과에 없으면: (보유/후보군)에서 이름을 찾고, 임시 weight를 부여
+                s = universe_by_code.get(c)
+                name = str(getattr(s, "name", "") or c) if s is not None else c
+                recommended.append(
+                    PortfolioWeight(
+                        code=c,
+                        name=name,
+                        weight=1.0,  # 아래에서 정규화(표시용)하므로 임시값
+                        reasoning="보유 종목(또는 후보군) 포함으로 최종 종목 수를 맞췄습니다.",
+                    )
+                )
+
+        # 최적화 결과가 없거나, 위 로직으로도 추천 목록이 비면: 점수 기반 균등배분(보유 우선 포함)으로 폴백
+        if not recommended and target_n > 0:
+            final_codes = list(holding_codes_ordered)
+            need = max(0, target_n - len(final_codes))
+            scored = sorted(
+                (universe or []),
+                key=lambda s: float(stock_scores.get(s.code, 0.0)),
+                reverse=True,
+            )
+            for s in scored:
+                if need <= 0:
+                    break
+                c = str(s.code or "").strip()
+                if not c or c in final_codes:
+                    continue
+                final_codes.append(c)
+                need -= 1
+
+            # 균등 비중
+            if final_codes:
+                w = 1.0 / float(len(final_codes))
+                for c in final_codes[:target_n]:
+                    s = universe_by_code.get(c)
+                    name = str(getattr(s, "name", "") or c) if s is not None else c
+                    recommended.append(
+                        PortfolioWeight(
+                            code=c,
+                            name=name,
+                            weight=w,
+                            reasoning="최적화 결과가 없어 (보유 종목 포함) 점수 상위 종목을 균등 비중으로 구성했습니다.",
+                        )
+                    )
 
         # 상위 N개로 자른 후, 비중이 1이 되도록 정규화(표시용)
         sum_w = float(sum(float(w.weight) for w in recommended)) if recommended else 0.0

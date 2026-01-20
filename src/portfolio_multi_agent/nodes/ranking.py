@@ -100,7 +100,7 @@ class Ranking:
 
         if not app_key or not app_secret or not access_token:
             raise ValueError(
-                "KIS 자격증명이 없습니다. LoadUserContext 단계에서 user 정보를 로드하지 못했습니다."
+                "KIS 자격증명이 없습니다. user 정보를 로드하지 못했습니다."
             )
 
         return {"app_key": app_key, "app_secret": app_secret, "access_token": access_token}
